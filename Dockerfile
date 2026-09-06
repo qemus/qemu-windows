@@ -26,7 +26,7 @@ WORKDIR /src
 
 ADD --keep-git-dir=true https://github.com/qemus/qemu-render.git#v1.2.0 /src/qemu-render
 
-# Native Vulkan scanout uses virglrenderer's extended resource metadata API.
+# Helios scanout code uses virglrenderer's extended resource metadata API.
 # Build against the exact virglrenderer revision selected by the latest
 # qemu-render master so the two projects stay on the same API automatically.
 RUN <<EOF_VIRGL
@@ -82,7 +82,7 @@ RUN <<EOF_SOURCE
   fi
 
   # Overlay the latest enhanced VMware SVGA II implementation onto the same
-  # QEMU 11.1 source tree that contains the Windows graphics integration. qemu-vmvga is
+  # QEMU 11.1 source tree that contains the Helios integration. qemu-vmvga is
   # source-only: its vmware_vga.c and VMware headers are compiled by QEMU.
   actual="$(git -C qemu-vmvga rev-parse HEAD)"
   echo "Using qemu-vmvga commit $actual"
@@ -233,7 +233,7 @@ RUN <<'EOF_BUILD'
   strip --strip-unneeded /out/qemu-system-x86_64
 
   # This symbol is referenced only when the extended virglrenderer metadata API
-  # was visible at compile time; without it native Windows scanout is incomplete.
+  # was visible at compile time; without it native Helios scanout is incomplete.
   readelf -Ws /out/qemu-system-x86_64 \
     | grep -Fq 'virgl_renderer_resource_get_info_ext' || {
       echo "FAIL: virglrenderer extended resource metadata support was not compiled in."
