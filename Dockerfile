@@ -186,9 +186,9 @@ RUN <<'EOF_BUILD'
     --enable-system \
     --enable-attr \
     --enable-bpf \
-    --enable-brlapi \
+    --disable-brlapi \
     --enable-cap-ng \
-    --enable-capstone \
+    --disable-capstone \
     --enable-curses \
     --enable-fdt \
     --enable-fuse \
@@ -204,14 +204,14 @@ RUN <<'EOF_BUILD'
     --enable-opengl \
     --enable-pixman \
     --enable-png \
-    --enable-rdma \
+    --disable-rdma \
     --enable-seccomp \
     --enable-slirp \
     --enable-smartcard \
     --enable-spice \
     --enable-tcg \
     --enable-usb-redir \
-    --enable-vde \
+    --disable-vde \
     --enable-vhost-net \
     --enable-vhost-user \
     --enable-vhost-vdpa \
