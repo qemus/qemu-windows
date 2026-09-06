@@ -102,16 +102,17 @@ RUN <<EOF_SOURCE
 
 EOF_SOURCE
 
-COPY files/ /tmp/helios-files/
-COPY patches/ /tmp/helios-patches/
+# Compatibility files and patches remain maintained in qemu-helios. Fetch them
+# at build time instead of carrying duplicate copies in this repository.
+ADD https://github.com/qemus/qemu-helios.git#master /tmp/qemu-helios
 
 RUN <<'EOF_PATCHES'
   set -eu
 
-  install -Dm644 /tmp/helios-files/vulkan-readback.c /src/qemu/ui/vulkan-readback.c
-  install -Dm644 /tmp/helios-files/vulkan-readback.h /src/qemu/ui/vulkan-readback.h
+  install -Dm644 /tmp/qemu-helios/files/vulkan-readback.c /src/qemu/ui/vulkan-readback.c
+  install -Dm644 /tmp/qemu-helios/files/vulkan-readback.h /src/qemu/ui/vulkan-readback.h
 
-  for patch in /tmp/helios-patches/*.patch; do
+  for patch in /tmp/qemu-helios/patches/*.patch; do
     echo "Applying ${patch##*/}..."
     git -C /src/qemu apply --recount --check "$patch"
     git -C /src/qemu apply --recount "$patch"
@@ -138,7 +139,7 @@ RUN <<'EOF_BUILD'
   printf 'Debian LDFLAGS: %s\n' "$extra_ldflags"
 
   /src/qemu/configure \
-    --with-pkgversion="Helios ${VERSION_ARG}" \
+    --with-pkgversion="qemu-windows ${VERSION_ARG}" \
     --target-list=x86_64-softmmu \
     --prefix=/usr \
     --libdir="/usr/lib/${multiarch}" \
@@ -245,7 +246,7 @@ RUN <<'EOF_BUILD'
     helios_vulkan_capture \
     helios_vulkan_publish; do
     strings /out/qemu-system-x86_64 | grep -Fq "$marker" || {
-      echo "FAIL: Helios marker is missing from the binary: $marker"
+      echo "FAIL: required Helios marker is missing from the binary: $marker"
       exit 1
     }
   done
@@ -296,8 +297,8 @@ FROM scratch AS artifact
 
 ARG VERSION_ARG="0.0.0"
 
-LABEL org.opencontainers.image.title="Helios" \
-      org.opencontainers.image.description="QEMU build with patches for accelerated Windows graphics." \
+LABEL org.opencontainers.image.title="QEMU Windows" \
+      org.opencontainers.image.description="QEMU build for running Windows guests with hardware-accelerated graphics." \
       org.opencontainers.image.version="${VERSION_ARG}"
 
 COPY --from=verify /out/qemu-system-x86_64 /usr/bin/qemu-system-x86_64
