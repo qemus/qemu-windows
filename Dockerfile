@@ -246,7 +246,7 @@ RUN <<'EOF_BUILD'
     helios_vulkan_capture \
     helios_vulkan_publish; do
     strings /out/qemu-system-x86_64 | grep -Fq "$marker" || {
-      echo "FAIL: required graphics marker is missing from the binary: $marker"
+      echo "FAIL: required Helios marker is missing from the binary: $marker"
       exit 1
     }
   done
