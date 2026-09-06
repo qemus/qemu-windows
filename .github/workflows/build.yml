@@ -95,7 +95,6 @@ jobs:
         run: gh release upload "v${VERSION}" ./qemu-system-x86_64 --clobber
       -
         name: Increment version variable
-        if: false
         uses: action-pack/increment@v2
         with:
           name: 'MINOR'
