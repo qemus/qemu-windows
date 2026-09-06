@@ -36,7 +36,7 @@ jobs:
             type=raw,value=latest,priority=100
             type=raw,value=${{ env.VERSION }}
           labels: |
-            org.opencontainers.image.title=Helios
+            org.opencontainers.image.title=qemu-windows
         env:
           DOCKER_METADATA_ANNOTATIONS_LEVELS: manifest
       -
@@ -66,8 +66,8 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           annotations: ${{ steps.meta.outputs.annotations }}
-          cache-from: type=gha,scope=qemu-helios
-          cache-to: type=gha,mode=max,scope=qemu-helios
+          cache-from: type=gha,scope=qemu-windows
+          cache-to: type=gha,mode=max,scope=qemu-windows
           build-args: |
             VERSION_ARG=${{ env.VERSION }}
       -
