@@ -60,6 +60,6 @@ QEMU Windows follows the licensing of QEMU and the individual components incorpo
 
 [Build]: https://github.com/qemus/qemu-windows/actions/workflows/build.yml/badge.svg
 [Version]: https://img.shields.io/github/v/release/qemus/qemu-windows?label=version
-[Size]: https://img.shields.io/github/repo-size/qemus/qemu-windows?label=size
+[Size]: https://img.shields.io/badge/size-29.2_MB-steelblue?style=flat&color=066da5
 [build_url]: https://github.com/qemus/qemu-windows/actions/workflows/build.yml
 [release_url]: https://github.com/qemus/qemu-windows/releases
