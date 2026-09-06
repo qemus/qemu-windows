@@ -26,7 +26,7 @@ WORKDIR /src
 
 ADD --keep-git-dir=true https://github.com/qemus/qemu-render.git#v1.2.0 /src/qemu-render
 
-# Helios scanout code uses virglrenderer's extended resource metadata API.
+# Native Vulkan scanout uses virglrenderer's extended resource metadata API.
 # Build against the exact virglrenderer revision selected by the latest
 # qemu-render master so the two projects stay on the same API automatically.
 RUN <<EOF_VIRGL
@@ -82,7 +82,7 @@ RUN <<EOF_SOURCE
   fi
 
   # Overlay the latest enhanced VMware SVGA II implementation onto the same
-  # QEMU 11.1 source tree that contains the Helios integration. qemu-vmvga is
+  # QEMU 11.1 source tree that contains the Windows graphics integration. qemu-vmvga is
   # source-only: its vmware_vga.c and VMware headers are compiled by QEMU.
   actual="$(git -C qemu-vmvga rev-parse HEAD)"
   echo "Using qemu-vmvga commit $actual"
@@ -102,16 +102,17 @@ RUN <<EOF_SOURCE
 
 EOF_SOURCE
 
-COPY files/ /tmp/helios-files/
-COPY patches/ /tmp/helios-patches/
+# Compatibility files and patches remain maintained in qemu-helios. Fetch them
+# at build time instead of carrying duplicate copies in this repository.
+ADD https://github.com/qemus/qemu-helios.git#master /tmp/qemu-helios
 
 RUN <<'EOF_PATCHES'
   set -eu
 
-  install -Dm644 /tmp/helios-files/vulkan-readback.c /src/qemu/ui/vulkan-readback.c
-  install -Dm644 /tmp/helios-files/vulkan-readback.h /src/qemu/ui/vulkan-readback.h
+  install -Dm644 /tmp/qemu-helios/files/vulkan-readback.c /src/qemu/ui/vulkan-readback.c
+  install -Dm644 /tmp/qemu-helios/files/vulkan-readback.h /src/qemu/ui/vulkan-readback.h
 
-  for patch in /tmp/helios-patches/*.patch; do
+  for patch in /tmp/qemu-helios/patches/*.patch; do
     echo "Applying ${patch##*/}..."
     git -C /src/qemu apply --recount --check "$patch"
     git -C /src/qemu apply --recount "$patch"
@@ -138,7 +139,7 @@ RUN <<'EOF_BUILD'
   printf 'Debian LDFLAGS: %s\n' "$extra_ldflags"
 
   /src/qemu/configure \
-    --with-pkgversion="Helios ${VERSION_ARG}" \
+    --with-pkgversion="qemu-windows ${VERSION_ARG}" \
     --target-list=x86_64-softmmu \
     --prefix=/usr \
     --libdir="/usr/lib/${multiarch}" \
@@ -232,7 +233,7 @@ RUN <<'EOF_BUILD'
   strip --strip-unneeded /out/qemu-system-x86_64
 
   # This symbol is referenced only when the extended virglrenderer metadata API
-  # was visible at compile time; without it native Helios scanout is incomplete.
+  # was visible at compile time; without it native Windows scanout is incomplete.
   readelf -Ws /out/qemu-system-x86_64 \
     | grep -Fq 'virgl_renderer_resource_get_info_ext' || {
       echo "FAIL: virglrenderer extended resource metadata support was not compiled in."
@@ -245,7 +246,7 @@ RUN <<'EOF_BUILD'
     helios_vulkan_capture \
     helios_vulkan_publish; do
     strings /out/qemu-system-x86_64 | grep -Fq "$marker" || {
-      echo "FAIL: Helios marker is missing from the binary: $marker"
+      echo "FAIL: required graphics marker is missing from the binary: $marker"
       exit 1
     }
   done
@@ -296,7 +297,7 @@ FROM scratch AS artifact
 
 ARG VERSION_ARG="0.0.0"
 
-LABEL org.opencontainers.image.title="Helios" \
+LABEL org.opencontainers.image.title="qemu-windows" \
       org.opencontainers.image.description="QEMU build with patches for accelerated Windows graphics." \
       org.opencontainers.image.version="${VERSION_ARG}"
 
