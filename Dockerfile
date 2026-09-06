@@ -297,8 +297,8 @@ FROM scratch AS artifact
 
 ARG VERSION_ARG="0.0.0"
 
-LABEL org.opencontainers.image.title="qemu-windows" \
-      org.opencontainers.image.description="QEMU build with patches for accelerated Windows graphics." \
+LABEL org.opencontainers.image.title="QEMU Windows" \
+      org.opencontainers.image.description="QEMU build for running Windows guests with hardware-accelerated graphics." \
       org.opencontainers.image.version="${VERSION_ARG}"
 
 COPY --from=verify /out/qemu-system-x86_64 /usr/bin/qemu-system-x86_64
