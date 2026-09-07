@@ -15,6 +15,7 @@ RUN <<EOF_BUILD_DEPS
   apt-get update
   apt-get install --no-install-recommends -y \
     dpkg-dev \
+    libbz2-dev \
     libvulkan-dev \
     python3-mako \
     python3-yaml
@@ -152,13 +153,9 @@ RUN <<'EOF_BUILD'
     --extra-ldflags="$extra_ldflags" \
     --audio-drv-list=alsa,oss \
     --disable-af-xdp \
-    --disable-blkio \
     --disable-brlapi \
-    --disable-bzip2 \
-    --disable-capstone \
     --disable-cocoa \
     --disable-containers \
-    --disable-curl \
     --disable-docs \
     --disable-download \
     --disable-gtk \
@@ -166,15 +163,11 @@ RUN <<'EOF_BUILD'
     --disable-install-blobs \
     --disable-jack \
     --disable-libcbor \
-    --disable-libiscsi \
-    --disable-libnfs \
-    --disable-libssh \
     --disable-linux-user \
     --disable-lzo \
     --disable-modules \
     --disable-pa \
     --disable-pipewire \
-    --disable-rbd \
     --disable-rdma \
     --disable-relocatable \
     --disable-sdl \
@@ -188,14 +181,21 @@ RUN <<'EOF_BUILD'
     --disable-xen \
     --disable-xkbcommon \
     --enable-attr \
+    --enable-blkio \
     --enable-bpf \
+    --enable-bzip2 \
     --enable-cap-ng \
+    --enable-capstone \
+    --enable-curl \
     --enable-curses \
     --enable-fdt \
     --enable-fuse \
     --enable-gnutls \
     --enable-kvm \
+    --enable-libiscsi \
+    --enable-libnfs \
     --enable-libpmem \
+    --enable-libssh \
     --enable-libusb \
     --enable-libudev \
     --enable-linux-aio \
@@ -205,6 +205,7 @@ RUN <<'EOF_BUILD'
     --enable-opengl \
     --enable-pixman \
     --enable-png \
+    --enable-rbd \
     --enable-seccomp \
     --enable-slirp \
     --enable-smartcard \
