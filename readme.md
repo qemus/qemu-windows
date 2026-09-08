@@ -43,6 +43,7 @@ The build currently combines:
 
 - upstream QEMU;
 - Hyper-V compatibility patches
+- Prefer performance cores patch
 - the enhanced SVGA implementation;
 - a Vulkan/Venus-enabled virglrenderer build;
 - additional Windows graphics compatibility fixes;
