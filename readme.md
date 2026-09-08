@@ -7,7 +7,7 @@
 
 </div></h1>
 
-Custom Linux build of QEMU for running Windows guests, focused on hardware-accelerated graphics and Windows compatibility.
+Custom Linux build of QEMU for running Windows guests, focused on hardware-accelerated graphics and system compatibility.
 
 ## What is QEMU Windows? 🪟
 
@@ -42,6 +42,7 @@ QEMU Windows provides a practical integration point for those changes while indi
 The build currently combines:
 
 - upstream QEMU;
+- Hyper-V compatibility patches
 - the enhanced SVGA implementation;
 - a Vulkan/Venus-enabled virglrenderer build;
 - additional Windows graphics compatibility fixes;
