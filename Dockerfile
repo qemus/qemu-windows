@@ -102,7 +102,10 @@ RUN <<EOF_SOURCE
 
 EOF_SOURCE
 
-# Compatibility files and patches remain maintained in qemu-helios. Fetch them
+# General QEMU compatibility patches maintained by qemu-windows.
+COPY patches /tmp/qemu-windows-patches
+
+# Helios-specific files and patches remain maintained in qemu-helios. Fetch them
 # at build time instead of carrying duplicate copies in this repository.
 ADD https://github.com/qemus/qemu-helios.git#master /tmp/qemu-helios
 
@@ -113,7 +116,13 @@ RUN <<'EOF_PATCHES'
   install -Dm644 /tmp/qemu-helios/files/vulkan-readback.h /src/qemu/ui/vulkan-readback.h
 
   for patch in /tmp/qemu-helios/patches/*.patch; do
-    echo "Applying ${patch##*/}..."
+    echo "Applying Helios ${patch##*/}..."
+    git -C /src/qemu apply --recount --check "$patch"
+    git -C /src/qemu apply --recount "$patch"
+  done
+
+  for patch in /tmp/qemu-windows-patches/*.patch; do
+    echo "Applying qemu-windows ${patch##*/}..."
     git -C /src/qemu apply --recount --check "$patch"
     git -C /src/qemu apply --recount "$patch"
   done

@@ -1,0 +1,286 @@
+diff --git a/docs/system/i386/hyperv.rst b/docs/system/i386/hyperv.rst
+index e1babffb0f997dbd04a9e6c15b7f7ec9e837502a..e5d621947a0f3524c266dcb559e4f4c461027684 100644
+--- a/docs/system/i386/hyperv.rst
++++ b/docs/system/i386/hyperv.rst
+@@ -269,8 +269,9 @@ Supplementary features
+ 
+   Note: ``hv-passthrough`` flag only enables enlightenments which are known to QEMU
+   (have corresponding 'hv-' flag) and copies ``hv-spinlocks`` and ``hv-vendor-id``
+-  values from KVM to QEMU. ``hv-passthrough`` overrides all other 'hv-' settings on
+-  the command line.
++  values from KVM to QEMU. Individual boolean enlightenments can be excluded from
++  pass-through mode with the ``-hv-*`` CPU feature syntax. The resulting feature set
++  must still satisfy all Hyper-V feature dependencies.
+ 
+   Note: ``hv-passthrough`` does not enable ``hv-syndbg`` which can prevent certain
+   Windows guests from booting when used without proper configuration. If needed,
+diff --git a/target/i386/cpu-internal.h b/target/i386/cpu-internal.h
+index 37c61a1bc3db655688f2750586627d8e967641ae..c1b83b24c4f2b50aeb245ca34c3e46450b075372 100644
+--- a/target/i386/cpu-internal.h
++++ b/target/i386/cpu-internal.h
+@@ -56,6 +56,7 @@ typedef struct FeatureWordInfo {
+ extern FeatureWordInfo feature_word_info[];
+ 
+ void x86_cpu_expand_features(X86CPU *cpu, Error **errp);
++bool x86_cpu_feature_explicitly_disabled(const char *feature);
+ 
+ #ifndef CONFIG_USER_ONLY
+ GuestPanicInformation *x86_cpu_get_crash_info(CPUState *cs);
+diff --git a/target/i386/cpu.c b/target/i386/cpu.c
+index 5805d33ab92d74155c5382e0acb0bb5781d2ce0b..99500b9b11fd749a7e5b49847f212de8d9f2283f 100644
+--- a/target/i386/cpu.c
++++ b/target/i386/cpu.c
+@@ -7869,6 +7869,11 @@ static gint compare_string(gconstpointer a, gconstpointer b)
+     return g_strcmp0(a, b);
+ }
+ 
++bool x86_cpu_feature_explicitly_disabled(const char *feature)
++{
++    return g_list_find_custom(minus_features, feature, compare_string) != NULL;
++}
++
+ /* Parse "+feature,-feature,feature=foo" CPU feature string
+  */
+ static void x86_cpu_parse_featurestr(const char *typename, char *features,
+diff --git a/target/i386/kvm/kvm.c b/target/i386/kvm/kvm.c
+index 644c45fb0a02a9991b90bcaefe637250417c9fb7..df0d33a96ca313f7691cda7786f685f763baa36f 100644
+--- a/target/i386/kvm/kvm.c
++++ b/target/i386/kvm/kvm.c
+@@ -28,6 +28,7 @@
+ #include "hw/xen/interface/arch-x86/cpuid.h"
+ 
+ #include "cpu.h"
++#include "cpu-internal.h"
+ #include "host-cpu.h"
+ #include "vmsr_energy.h"
+ #include "system/system.h"
+@@ -968,6 +969,7 @@ static bool tsc_is_stable_and_known(CPUX86State *env)
+ #define DEFAULT_EVMCS_VERSION ((1 << 8) | 1)
+ 
+ static struct {
++    const char *name;
+     const char *desc;
+     struct {
+         uint32_t func;
+@@ -978,6 +980,7 @@ static struct {
+     bool skip_passthrough;
+ } kvm_hyperv_properties[] = {
+     [HYPERV_FEAT_RELAXED] = {
++        .name = "hv-relaxed",
+         .desc = "relaxed timing (hv-relaxed)",
+         .flags = {
+             {.func = HV_CPUID_ENLIGHTMENT_INFO, .reg = R_EAX,
+@@ -985,6 +988,7 @@ static struct {
+         }
+     },
+     [HYPERV_FEAT_VAPIC] = {
++        .name = "hv-vapic",
+         .desc = "virtual APIC (hv-vapic)",
+         .flags = {
+             {.func = HV_CPUID_FEATURES, .reg = R_EAX,
+@@ -992,6 +996,7 @@ static struct {
+         }
+     },
+     [HYPERV_FEAT_TIME] = {
++        .name = "hv-time",
+         .desc = "clocksources (hv-time)",
+         .flags = {
+             {.func = HV_CPUID_FEATURES, .reg = R_EAX,
+@@ -999,6 +1004,7 @@ static struct {
+         }
+     },
+     [HYPERV_FEAT_CRASH] = {
++        .name = "hv-crash",
+         .desc = "crash MSRs (hv-crash)",
+         .flags = {
+             {.func = HV_CPUID_FEATURES, .reg = R_EDX,
+@@ -1006,6 +1012,7 @@ static struct {
+         }
+     },
+     [HYPERV_FEAT_RESET] = {
++        .name = "hv-reset",
+         .desc = "reset MSR (hv-reset)",
+         .flags = {
+             {.func = HV_CPUID_FEATURES, .reg = R_EAX,
+@@ -1013,6 +1020,7 @@ static struct {
+         }
+     },
+     [HYPERV_FEAT_VPINDEX] = {
++        .name = "hv-vpindex",
+         .desc = "VP_INDEX MSR (hv-vpindex)",
+         .flags = {
+             {.func = HV_CPUID_FEATURES, .reg = R_EAX,
+@@ -1020,6 +1028,7 @@ static struct {
+         }
+     },
+     [HYPERV_FEAT_RUNTIME] = {
++        .name = "hv-runtime",
+         .desc = "VP_RUNTIME MSR (hv-runtime)",
+         .flags = {
+             {.func = HV_CPUID_FEATURES, .reg = R_EAX,
+@@ -1027,6 +1036,7 @@ static struct {
+         }
+     },
+     [HYPERV_FEAT_SYNIC] = {
++        .name = "hv-synic",
+         .desc = "synthetic interrupt controller (hv-synic)",
+         .flags = {
+             {.func = HV_CPUID_FEATURES, .reg = R_EAX,
+@@ -1034,6 +1044,7 @@ static struct {
+         }
+     },
+     [HYPERV_FEAT_STIMER] = {
++        .name = "hv-stimer",
+         .desc = "synthetic timers (hv-stimer)",
+         .flags = {
+             {.func = HV_CPUID_FEATURES, .reg = R_EAX,
+@@ -1042,6 +1053,7 @@ static struct {
+         .dependencies = BIT(HYPERV_FEAT_SYNIC) | BIT(HYPERV_FEAT_TIME)
+     },
+     [HYPERV_FEAT_FREQUENCIES] = {
++        .name = "hv-frequencies",
+         .desc = "frequency MSRs (hv-frequencies)",
+         .flags = {
+             {.func = HV_CPUID_FEATURES, .reg = R_EAX,
+@@ -1051,6 +1063,7 @@ static struct {
+         }
+     },
+     [HYPERV_FEAT_REENLIGHTENMENT] = {
++        .name = "hv-reenlightenment",
+         .desc = "reenlightenment MSRs (hv-reenlightenment)",
+         .flags = {
+             {.func = HV_CPUID_FEATURES, .reg = R_EAX,
+@@ -1058,6 +1071,7 @@ static struct {
+         }
+     },
+     [HYPERV_FEAT_TLBFLUSH] = {
++        .name = "hv-tlbflush",
+         .desc = "paravirtualized TLB flush (hv-tlbflush)",
+         .flags = {
+             {.func = HV_CPUID_ENLIGHTMENT_INFO, .reg = R_EAX,
+@@ -1067,6 +1081,7 @@ static struct {
+         .dependencies = BIT(HYPERV_FEAT_VPINDEX)
+     },
+     [HYPERV_FEAT_EVMCS] = {
++        .name = "hv-evmcs",
+         .desc = "enlightened VMCS (hv-evmcs)",
+         .flags = {
+             {.func = HV_CPUID_ENLIGHTMENT_INFO, .reg = R_EAX,
+@@ -1075,6 +1090,7 @@ static struct {
+         .dependencies = BIT(HYPERV_FEAT_VAPIC)
+     },
+     [HYPERV_FEAT_IPI] = {
++        .name = "hv-ipi",
+         .desc = "paravirtualized IPI (hv-ipi)",
+         .flags = {
+             {.func = HV_CPUID_ENLIGHTMENT_INFO, .reg = R_EAX,
+@@ -1084,6 +1100,7 @@ static struct {
+         .dependencies = BIT(HYPERV_FEAT_VPINDEX)
+     },
+     [HYPERV_FEAT_STIMER_DIRECT] = {
++        .name = "hv-stimer-direct",
+         .desc = "direct mode synthetic timers (hv-stimer-direct)",
+         .flags = {
+             {.func = HV_CPUID_FEATURES, .reg = R_EDX,
+@@ -1092,6 +1109,7 @@ static struct {
+         .dependencies = BIT(HYPERV_FEAT_STIMER)
+     },
+     [HYPERV_FEAT_AVIC] = {
++        .name = "hv-avic",
+         .desc = "AVIC/APICv support (hv-avic/hv-apicv)",
+         .flags = {
+             {.func = HV_CPUID_ENLIGHTMENT_INFO, .reg = R_EAX,
+@@ -1099,6 +1117,7 @@ static struct {
+         }
+     },
+     [HYPERV_FEAT_SYNDBG] = {
++        .name = "hv-syndbg",
+         .desc = "Enable synthetic kernel debugger channel (hv-syndbg)",
+         .flags = {
+             {.func = HV_CPUID_FEATURES, .reg = R_EDX,
+@@ -1108,6 +1127,7 @@ static struct {
+         .skip_passthrough = true,
+     },
+     [HYPERV_FEAT_MSR_BITMAP] = {
++        .name = "hv-emsr-bitmap",
+         .desc = "enlightened MSR-Bitmap (hv-emsr-bitmap)",
+         .flags = {
+             {.func = HV_CPUID_NESTED_FEATURES, .reg = R_EAX,
+@@ -1115,6 +1135,7 @@ static struct {
+         }
+     },
+     [HYPERV_FEAT_XMM_INPUT] = {
++        .name = "hv-xmm-input",
+         .desc = "XMM fast hypercall input (hv-xmm-input)",
+         .flags = {
+             {.func = HV_CPUID_FEATURES, .reg = R_EDX,
+@@ -1122,6 +1143,7 @@ static struct {
+         }
+     },
+     [HYPERV_FEAT_TLBFLUSH_EXT] = {
++        .name = "hv-tlbflush-ext",
+         .desc = "Extended gva ranges for TLB flush hypercalls (hv-tlbflush-ext)",
+         .flags = {
+             {.func = HV_CPUID_FEATURES, .reg = R_EDX,
+@@ -1130,6 +1152,7 @@ static struct {
+         .dependencies = BIT(HYPERV_FEAT_TLBFLUSH)
+     },
+     [HYPERV_FEAT_TLBFLUSH_DIRECT] = {
++        .name = "hv-tlbflush-direct",
+         .desc = "direct TLB flush (hv-tlbflush-direct)",
+         .flags = {
+             {.func = HV_CPUID_NESTED_FEATURES, .reg = R_EAX,
+@@ -1380,6 +1403,17 @@ static bool hyperv_feature_supported(CPUState *cs, int feature)
+     return true;
+ }
+ 
++static bool hyperv_feature_explicitly_disabled(int feature)
++{
++    if (x86_cpu_feature_explicitly_disabled(
++            kvm_hyperv_properties[feature].name)) {
++        return true;
++    }
++
++    return feature == HYPERV_FEAT_AVIC &&
++        x86_cpu_feature_explicitly_disabled("hv-apicv");
++}
++
+ /* Checks that all feature dependencies are enabled */
+ static bool hv_feature_check_deps(X86CPU *cpu, int feature, Error **errp)
+ {
+@@ -1445,6 +1479,7 @@ bool kvm_hyperv_expand_features(X86CPU *cpu, Error **errp)
+ {
+     CPUState *cs = CPU(cpu);
+     Error *local_err = NULL;
++    bool passthrough_exclusion = false;
+     int feat;
+ 
+     if (!hyperv_enabled(cpu))
+@@ -1511,11 +1546,27 @@ bool kvm_hyperv_expand_features(X86CPU *cpu, Error **errp)
+          * hv_build_cpuid_leaf() uses this info to build guest CPUIDs.
+          */
+         for (feat = 0; feat < ARRAY_SIZE(kvm_hyperv_properties); feat++) {
++            if (hyperv_feature_explicitly_disabled(feat)) {
++                cpu->hyperv_features &= ~BIT(feat);
++                passthrough_exclusion = true;
++                continue;
++            }
++
+             if (hyperv_feature_supported(cs, feat) &&
+                 !kvm_hyperv_properties[feat].skip_passthrough) {
+                 cpu->hyperv_features |= BIT(feat);
+             }
+         }
++
++        if (passthrough_exclusion) {
++            for (feat = 0; feat < ARRAY_SIZE(kvm_hyperv_properties); feat++) {
++                if (hyperv_feat_enabled(cpu, feat) &&
++                    !hv_feature_check_deps(cpu, feat, &local_err)) {
++                    error_propagate(errp, local_err);
++                    return false;
++                }
++            }
++        }
+     } else {
+         /* Check features availability and dependencies */
+         for (feat = 0; feat < ARRAY_SIZE(kvm_hyperv_properties); feat++) {
