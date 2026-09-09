@@ -1,5 +1,5 @@
 diff --git a/hw/i386/vmport.c b/hw/i386/vmport.c
-index 865e0e70db6e6bcf6d98112e3f185154da1d7083..2714c27f96865987905f8578cac0a8bcec60104f 100644
+index 865e0e70db6e6bcf6d98112e3f185154da1d7083..37a6866c150fbd40b13339eae7b151a143452131 100644
 --- a/hw/i386/vmport.c
 +++ b/hw/i386/vmport.c
 @@ -42,6 +42,36 @@
@@ -48,7 +48,7 @@ index 865e0e70db6e6bcf6d98112e3f185154da1d7083..2714c27f96865987905f8578cac0a8bc
  };
  
  static VMPortState *port_state;
-@@ -154,6 +186,228 @@ static void vmport_ioport_write(void *opaque, hwaddr addr,
+@@ -154,6 +186,252 @@ static void vmport_ioport_write(void *opaque, hwaddr addr,
      cpu->env.regs[R_EAX] = vmport_ioport_read(opaque, addr, 4);
  }
  
@@ -80,9 +80,11 @@ index 865e0e70db6e6bcf6d98112e3f185154da1d7083..2714c27f96865987905f8578cac0a8bc
 +    memset(channel, 0, sizeof(*channel));
 +}
 +
-+static void vmport_guestrpc_print_log(const uint8_t *message, size_t size)
++static GString *vmport_guestrpc_format_line(const char *prefix,
++                                             const uint8_t *message,
++                                             size_t size)
 +{
-+    GString *line = g_string_new("vmport-log: ");
++    GString *line = g_string_new(prefix);
 +    size_t i;
 +
 +    for (i = 0; i < size; i++) {
@@ -108,8 +110,29 @@ index 865e0e70db6e6bcf6d98112e3f185154da1d7083..2714c27f96865987905f8578cac0a8bc
 +        }
 +    }
 +
++    return line;
++}
++
++static void vmport_guestrpc_print_log(const uint8_t *message, size_t size)
++{
++    GString *line = vmport_guestrpc_format_line("vmport-log: ",
++                                                 message, size);
++
 +    fprintf(stderr, "%s\n", line->str);
 +    fflush(stderr);
++    g_string_free(line, true);
++}
++
++static void vmport_guestrpc_print_rpc(const uint8_t *message, size_t size)
++{
++    GString *line;
++
++    if (!qemu_loglevel_mask(LOG_UNIMP)) {
++        return;
++    }
++
++    line = vmport_guestrpc_format_line("vmport-rpc: ", message, size);
++    qemu_log_mask(LOG_UNIMP, "%s\n", line->str);
 +    g_string_free(line, true);
 +}
 +
@@ -125,6 +148,7 @@ index 865e0e70db6e6bcf6d98112e3f185154da1d7083..2714c27f96865987905f8578cac0a8bc
 +        channel->reply = success_reply;
 +        channel->reply_size = sizeof(success_reply) - 1;
 +    } else {
++        vmport_guestrpc_print_rpc(channel->request, channel->request_size);
 +        channel->reply = unknown_reply;
 +        channel->reply_size = sizeof(unknown_reply) - 1;
 +    }
@@ -277,7 +301,7 @@ index 865e0e70db6e6bcf6d98112e3f185154da1d7083..2714c27f96865987905f8578cac0a8bc
  static uint32_t vmport_cmd_get_version(void *opaque, uint32_t addr)
  {
      X86CPU *cpu = X86_CPU(current_cpu);
-@@ -244,6 +498,7 @@ static void vmport_realizefn(DeviceState *dev, Error **errp)
+@@ -244,6 +522,7 @@ static void vmport_realizefn(DeviceState *dev, Error **errp)
      /* Register some generic port commands */
      vmport_register(VMPORT_CMD_GETVERSION, vmport_cmd_get_version, NULL);
      vmport_register(VMPORT_CMD_GETRAMSIZE, vmport_cmd_ram_size, NULL);
