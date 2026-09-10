@@ -1026,7 +1026,6 @@ static bool vmbp_handle_ldr_load(X86CPU *cpu, struct kvm_sregs *sregs,
 static bool vmbp_handle_handle_write(X86CPU *cpu, struct kvm_sregs *sregs,
                                      VmbpWalk *walk, unsigned pending_index)
 {
-    CPUState *cs = CPU(cpu);
     CPUX86State *env = &cpu->env;
     VmbpPending *pending;
     uint64_t cr3 = sregs->cr3 & VMBP_PHYS_MASK;
