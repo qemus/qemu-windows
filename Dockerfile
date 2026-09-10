@@ -129,10 +129,9 @@ RUN <<'EOF_PATCHES'
 
   # Allow VMware user-mode display drivers on x64 Windows to reach the VMware
   # backdoor ports without requiring the host-wide KVM vmware_backdoor option.
-  # Each x64 vCPU independently waits until the same Windows-style TSS candidate
-  # is observed twice before installing a deny-by-default TSS I/O bitmap that
-  # permits only 0x5658-0x565b. This diagnostic build characterizes candidate
-  # memory before writing, verifies readback, and samples installed state.
+  # Each x64 vCPU independently probes for a Windows-style TSS and installs a
+  # deny-by-default I/O bitmap immediately when the candidate fully qualifies.
+  # The bitmap permits only 0x5658-0x565b and is verified once after writing.
   python3 - <<'EOF_VMPORT_TSS'
 from pathlib import Path
 
@@ -175,14 +174,32 @@ static bool kvm_vmport_tss_vmport_present(void)
 
 static bool kvm_vmport_tss_should_probe(X86CPU *cpu)
 {
+    CPUState *cs = CPU(cpu);
+    struct kvm_sregs sregs;
     int state = qatomic_read(&kvm_vmport_tss_vmport_state);
+    uint8_t lma;
+    int ret;
 
     if (state == 1 || cpu->env.tr.limit == KVM_VMPORT_TSS_IOMAP_LIMIT) {
         return false;
     }
 
-    /* No wall-clock throttle: until installation, inspect every KVM exit. */
-    return true;
+    /* The first pass still takes the BQL so vmport_present() can resolve the
+     * QOM object safely. After that, reject ordinary KVM exits lock-free.
+     */
+    if (state == 0) {
+        return true;
+    }
+
+    ret = kvm_vcpu_ioctl(cs, KVM_GET_SREGS, &sregs);
+    if (ret < 0) {
+        return false;
+    }
+
+    lma = !!(sregs.efer & MSR_EFER_LMA);
+    return lma && sregs.tr.present && sregs.tr.type == 11 &&
+           sregs.tr.base &&
+           sregs.tr.limit == KVM_VMPORT_TSS_ORIGINAL_LIMIT;
 }
 
 static bool kvm_vmport_tss_verify_map(CPUState *cs, uint64_t base,
