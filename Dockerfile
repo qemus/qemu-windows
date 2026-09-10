@@ -130,8 +130,10 @@ RUN <<'EOF_PATCHES'
   # Experimental VMware x64 UMD loader-triggered breakpoint compatibility.
   # Uses only stock KVM guest-debug ioctls.  Bootstrap ntdll once by placing a
   # temporary execution breakpoint on MSR_LSTAR (the x64 SYSCALL entry), then
-  # keep a loader breakpoint on LdrLoadDll.  While a VMware UMD is loading,
-  # trace NtMapViewOfSection entry/return to learn its ASLR base immediately.
+  # Keep a loader breakpoint on LdrLoadDll.  When a VMware UMD starts loading,
+  # place a temporary write watchpoint directly on LdrLoadDll's DllHandle output
+  # variable.  The write gives us the exact ASLR image base without scanning or
+  # tracing unrelated NtMapViewOfSection calls.
   # No recurring executable-page scan and no host-kernel/guest modifications.
   mkdir -p /tmp/vmport-bp
   cat > /tmp/vmport-bp/vmport-bp-core.h <<'EOF_VMBP_CORE'
@@ -340,8 +342,7 @@ typedef enum VmbpSlotKind {
     VMBP_SLOT_NONE,
     VMBP_SLOT_BOOTSTRAP_LSTAR,
     VMBP_SLOT_LDR_LOAD_DLL,
-    VMBP_SLOT_NT_MAP_ENTRY,
-    VMBP_SLOT_NT_MAP_RETURN,
+    VMBP_SLOT_DLL_HANDLE_WRITE,
     VMBP_SLOT_VMPORT,
 } VmbpSlotKind;
 
@@ -357,8 +358,7 @@ typedef struct VmbpPending {
     bool active;
     uint64_t cr3;
     uint64_t dll_handle_ptr;
-    uint64_t map_base_ptr;
-    uint64_t map_return_ip;
+    uint64_t stamp;
     int64_t expires_us;
     unsigned profile;
 } VmbpPending;
@@ -367,14 +367,13 @@ static VmbpSite vmbp_sites[VMBP_TRACKED_SITES];
 static VmbpPending vmbp_pending[VMBP_MAX_PENDING];
 static uint64_t vmbp_lstar;
 static uint64_t vmbp_ldr_load_dll;
-static uint64_t vmbp_nt_map_view;
 static uint64_t vmbp_stamp;
 static unsigned vmbp_generation = 1;
 static bool vmbp_initialized;
 static bool vmbp_enabled;
 static bool vmbp_debugger_warning;
 static unsigned vmbp_bootstrap_logs;
-static unsigned vmbp_map_miss_logs;
+static unsigned vmbp_handle_miss_logs;
 
 static bool vmbp_ram_read(void *opaque, uint64_t pa, void *dst, size_t size)
 {
@@ -603,10 +602,9 @@ static void vmbp_reset(void *opaque)
     memset(vmbp_pending, 0, sizeof(vmbp_pending));
     vmbp_lstar = 0;
     qatomic_set(&vmbp_ldr_load_dll, 0);
-    vmbp_nt_map_view = 0;
     vmbp_stamp = 0;
     vmbp_bootstrap_logs = 0;
-    vmbp_map_miss_logs = 0;
+    vmbp_handle_miss_logs = 0;
     CPU_FOREACH(cs) {
         memset(&X86_CPU(cs)->vmport_bp, 0, sizeof(X86_CPU(cs)->vmport_bp));
     }
@@ -634,32 +632,21 @@ static void vmbp_initialize(void)
     qemu_register_reset(vmbp_reset, NULL);
     qatomic_set(&vmbp_enabled, true);
     qatomic_set(&vmbp_initialized, true);
-    fprintf(stderr, "vmport-bp: LSTAR-bootstrap x64 UMD breakpoints enabled; "
+    fprintf(stderr, "vmport-bp: LSTAR/handle-watch x64 UMD breakpoints enabled; "
                     "no recurring executable-page scan\n");
 }
 
-static VmbpPending *vmbp_find_pending(uint64_t cr3)
+static int vmbp_find_pending(uint64_t cr3, uint64_t dll_handle_ptr)
 {
     unsigned i;
 
     for (i = 0; i < VMBP_MAX_PENDING; i++) {
-        if (vmbp_pending[i].active && vmbp_pending[i].cr3 == cr3) {
-            return &vmbp_pending[i];
+        if (vmbp_pending[i].active && vmbp_pending[i].cr3 == cr3 &&
+            vmbp_pending[i].dll_handle_ptr == dll_handle_ptr) {
+            return i;
         }
     }
-    return NULL;
-}
-
-static VmbpPending *vmbp_pick_pending(void)
-{
-    unsigned i;
-
-    for (i = 0; i < VMBP_MAX_PENDING; i++) {
-        if (vmbp_pending[i].active) {
-            return &vmbp_pending[i];
-        }
-    }
-    return NULL;
+    return -1;
 }
 
 static bool vmbp_expire_pending(void)
@@ -671,9 +658,10 @@ static bool vmbp_expire_pending(void)
     for (i = 0; i < VMBP_MAX_PENDING; i++) {
         if (vmbp_pending[i].active && vmbp_pending[i].expires_us <= now) {
             fprintf(stderr, "vmport-bp: load timeout cr3=0x%" PRIx64
-                            " target=%s\n",
+                            " target=%s handle-out=0x%" PRIx64 "\n",
                     vmbp_pending[i].cr3,
-                    vmbp_profiles[vmbp_pending[i].profile].name);
+                    vmbp_profiles[vmbp_pending[i].profile].name,
+                    vmbp_pending[i].dll_handle_ptr);
             vmbp_pending[i].active = false;
             changed = true;
         }
@@ -681,31 +669,55 @@ static bool vmbp_expire_pending(void)
     return changed;
 }
 
-static VmbpPending *vmbp_add_pending(uint64_t cr3, unsigned profile,
-                                     uint64_t dll_handle_ptr)
+static int vmbp_add_pending(uint64_t cr3, unsigned profile,
+                            uint64_t dll_handle_ptr)
 {
-    VmbpPending *p = vmbp_find_pending(cr3);
-    unsigned i;
+    int existing = vmbp_find_pending(cr3, dll_handle_ptr);
+    unsigned i, victim = 0;
+    uint64_t oldest = UINT64_MAX;
 
-    if (!p) {
-        for (i = 0; i < VMBP_MAX_PENDING; i++) {
-            if (!vmbp_pending[i].active) {
-                p = &vmbp_pending[i];
-                break;
-            }
+    if (existing >= 0) {
+        vmbp_pending[existing].profile = profile;
+        vmbp_pending[existing].stamp = ++vmbp_stamp;
+        vmbp_pending[existing].expires_us = g_get_monotonic_time() + 2000000;
+        return existing;
+    }
+    for (i = 0; i < VMBP_MAX_PENDING; i++) {
+        if (!vmbp_pending[i].active) {
+            victim = i;
+            oldest = 0;
+            break;
+        }
+        if (vmbp_pending[i].stamp < oldest) {
+            oldest = vmbp_pending[i].stamp;
+            victim = i;
         }
     }
-    if (!p) {
-        p = &vmbp_pending[0];
-    }
-    *p = (VmbpPending) {
+    vmbp_pending[victim] = (VmbpPending) {
         .active = true,
         .cr3 = cr3,
         .dll_handle_ptr = dll_handle_ptr,
+        .stamp = ++vmbp_stamp,
         .expires_us = g_get_monotonic_time() + 2000000,
         .profile = profile,
     };
-    return p;
+    return victim;
+}
+
+static int vmbp_newest_pending_not_in(uint32_t used)
+{
+    int best = -1;
+    uint64_t stamp = 0;
+    unsigned i;
+
+    for (i = 0; i < VMBP_MAX_PENDING; i++) {
+        if (!(used & (1U << i)) && vmbp_pending[i].active &&
+            vmbp_pending[i].stamp >= stamp) {
+            best = i;
+            stamp = vmbp_pending[i].stamp;
+        }
+    }
+    return best;
 }
 
 static int vmbp_find_site_by_ip(uint64_t ip)
@@ -753,7 +765,7 @@ static int vmbp_add_site(unsigned profile, uint64_t base)
 }
 
 /* Called at the end of post_run.  Bootstrap is a small PEB/export walk and
- * stops permanently as soon as ntdll's two loader addresses are known.
+ * stops permanently as soon as ntdll's LdrLoadDll address is known.
  */
 static void vmbp_poll(CPUState *cs)
 {
@@ -831,14 +843,14 @@ static void vmbp_populate_debug(CPUState *cs, struct kvm_guest_debug *dbg,
                                 unsigned debugger_slots)
 {
     X86CPU *cpu = X86_CPU(cs);
-    VmbpPending *p;
     unsigned slot = 0;
+    uint32_t used_pending = 0;
     uint32_t used_sites = 0;
 
     dbg->pad = 0;
     cpu->vmport_bp.slot_mask = 0;
     memset(cpu->vmport_bp.slot_kind, 0, sizeof(cpu->vmport_bp.slot_kind));
-    memset(cpu->vmport_bp.slot_site, 0xff, sizeof(cpu->vmport_bp.slot_site));
+    memset(cpu->vmport_bp.slot_index, 0xff, sizeof(cpu->vmport_bp.slot_index));
     memset(cpu->vmport_bp.slot_ip, 0, sizeof(cpu->vmport_bp.slot_ip));
 
     if (!qatomic_read(&vmbp_enabled)) {
@@ -861,31 +873,47 @@ static void vmbp_populate_debug(CPUState *cs, struct kvm_guest_debug *dbg,
     dbg->control |= KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_USE_HW_BP;
     dbg->arch.debugreg[7] = 0x0600;
 
-#define VMBP_ARM(_kind, _ip, _site) do { \
+#define VMBP_ARM_EXEC(_kind, _ip, _index) do { \
         dbg->arch.debugreg[slot] = (_ip); \
         dbg->arch.debugreg[7] |= UINT64_C(2) << (slot * 2); \
         cpu->vmport_bp.slot_mask |= 1U << slot; \
         cpu->vmport_bp.slot_kind[slot] = (_kind); \
-        cpu->vmport_bp.slot_site[slot] = (_site); \
+        cpu->vmport_bp.slot_index[slot] = (_index); \
+        cpu->vmport_bp.slot_ip[slot] = (_ip); \
+        slot++; \
+    } while (0)
+
+#define VMBP_ARM_WRITE8(_ip, _index) do { \
+        dbg->arch.debugreg[slot] = (_ip); \
+        dbg->arch.debugreg[7] |= (UINT64_C(2) << (slot * 2)) | \
+            (UINT64_C(1) << (16 + slot * 4)) | \
+            (UINT64_C(2) << (18 + slot * 4)); \
+        cpu->vmport_bp.slot_mask |= 1U << slot; \
+        cpu->vmport_bp.slot_kind[slot] = VMBP_SLOT_DLL_HANDLE_WRITE; \
+        cpu->vmport_bp.slot_index[slot] = (_index); \
         cpu->vmport_bp.slot_ip[slot] = (_ip); \
         slot++; \
     } while (0)
 
     if (!qatomic_read(&vmbp_ldr_load_dll)) {
-        VMBP_ARM(VMBP_SLOT_BOOTSTRAP_LSTAR, vmbp_lstar, UINT32_MAX);
+        VMBP_ARM_EXEC(VMBP_SLOT_BOOTSTRAP_LSTAR, vmbp_lstar, UINT32_MAX);
         return;
     }
 
-    VMBP_ARM(VMBP_SLOT_LDR_LOAD_DLL, qatomic_read(&vmbp_ldr_load_dll),
-             UINT32_MAX);
+    /* DR0 remains the cheap loader trigger.  The remaining three slots are
+     * first used for target-specific DllHandle writes, then for the newest
+     * resolved vmport instruction addresses.
+     */
+    VMBP_ARM_EXEC(VMBP_SLOT_LDR_LOAD_DLL, qatomic_read(&vmbp_ldr_load_dll),
+                  UINT32_MAX);
 
-    p = vmbp_pick_pending();
-    if (p && slot < 4) {
-        if (p->map_return_ip) {
-            VMBP_ARM(VMBP_SLOT_NT_MAP_RETURN, p->map_return_ip, UINT32_MAX);
-        } else if (vmbp_nt_map_view) {
-            VMBP_ARM(VMBP_SLOT_NT_MAP_ENTRY, vmbp_nt_map_view, UINT32_MAX);
+    while (slot < 4) {
+        int pending = vmbp_newest_pending_not_in(used_pending);
+        if (pending < 0) {
+            break;
         }
+        used_pending |= 1U << pending;
+        VMBP_ARM_WRITE8(vmbp_pending[pending].dll_handle_ptr, pending);
     }
     while (slot < 4) {
         int site = vmbp_newest_site_not_in(used_sites);
@@ -893,9 +921,10 @@ static void vmbp_populate_debug(CPUState *cs, struct kvm_guest_debug *dbg,
             break;
         }
         used_sites |= 1U << site;
-        VMBP_ARM(VMBP_SLOT_VMPORT, vmbp_sites[site].ip, site);
+        VMBP_ARM_EXEC(VMBP_SLOT_VMPORT, vmbp_sites[site].ip, site);
     }
-#undef VMBP_ARM
+#undef VMBP_ARM_WRITE8
+#undef VMBP_ARM_EXEC
 }
 
 static void vmbp_pre_run(CPUState *cs)
@@ -929,7 +958,7 @@ static bool vmbp_handle_bootstrap_lstar(X86CPU *cpu,
     CPUState *cs = CPU(cpu);
     CPUX86State *env = &cpu->env;
     VmbpWalk walk;
-    uint64_t ntdll = 0, ldr = 0, map = 0;
+    uint64_t ntdll = 0, ldr = 0;
 
     walk = (VmbpWalk) {
         .read = vmbp_ram_read,
@@ -946,8 +975,7 @@ static bool vmbp_handle_bootstrap_lstar(X86CPU *cpu,
         (sregs->cs.selector & 3) != 0 || !sregs->gs.base ||
         sregs->gs.base >= VMBP_USER_END ||
         !vmbp_find_ntdll(&walk, sregs->gs.base, &ntdll) ||
-        !vmbp_resolve_export(&walk, ntdll, "LdrLoadDll", &ldr) ||
-        !vmbp_resolve_export(&walk, ntdll, "NtMapViewOfSection", &map)) {
+        !vmbp_resolve_export(&walk, ntdll, "LdrLoadDll", &ldr)) {
         if (vmbp_bootstrap_logs++ < 8) {
             fprintf(stderr, "vmport-bp: LSTAR bootstrap retry vcpu=%d "
                             "cr3=0x%" PRIx64 " cs=0x%x gs=0x%" PRIx64 "\n",
@@ -958,13 +986,11 @@ static bool vmbp_handle_bootstrap_lstar(X86CPU *cpu,
         return true;
     }
 
-    vmbp_nt_map_view = map;
     qatomic_set(&vmbp_ldr_load_dll, ldr);
     vmbp_lstar = 0;
     fprintf(stderr, "vmport-bp: bootstrap ntdll=0x%" PRIx64
-                    " LdrLoadDll=0x%" PRIx64
-                    " NtMapViewOfSection=0x%" PRIx64 "\n",
-            ntdll, ldr, map);
+                    " LdrLoadDll=0x%" PRIx64 "\n",
+            ntdll, ldr);
     vmbp_publish_debug_change();
     env->eflags |= RF_MASK;
     return true;
@@ -985,117 +1011,64 @@ static bool vmbp_handle_ldr_load(X86CPU *cpu, struct kvm_sregs *sregs,
         return true;
     }
     profile = vmbp_profile_for_name(name);
-    if (profile >= 0) {
-        vmbp_add_pending(cr3, profile, env->regs[R_R9]);
+    if (profile >= 0 && env->regs[R_R9] && !(env->regs[R_R9] & 7)) {
+        int pending = vmbp_add_pending(cr3, profile, env->regs[R_R9]);
         fprintf(stderr, "vmport-bp: load %s vcpu=%d cr3=0x%" PRIx64
-                        " handle-out=0x%" PRIx64 "\n",
+                        " handle-out=0x%" PRIx64 " pending=%d\n",
                 vmbp_profiles[profile].name, cs->cpu_index, cr3,
-                (uint64_t)env->regs[R_R9]);
+                (uint64_t)env->regs[R_R9], pending);
         vmbp_publish_debug_change();
     }
     env->eflags |= RF_MASK;
     return true;
 }
 
-static bool vmbp_handle_map_entry(X86CPU *cpu, struct kvm_sregs *sregs,
-                                  VmbpWalk *walk)
+static bool vmbp_handle_handle_write(X86CPU *cpu, struct kvm_sregs *sregs,
+                                     VmbpWalk *walk, unsigned pending_index)
 {
     CPUState *cs = CPU(cpu);
     CPUX86State *env = &cpu->env;
+    VmbpPending *pending;
     uint64_t cr3 = sregs->cr3 & VMBP_PHYS_MASK;
-    VmbpPending *pending = vmbp_find_pending(cr3);
-    uint64_t return_ip = 0;
-    uint64_t pa;
-    bool executable;
-
-    if (!pending) {
-        env->eflags |= RF_MASK;
-        return true;
-    }
-
-    /* At the exported NtMapViewOfSection entry, R8 is still the ABI-defined
-     * BaseAddress output pointer and [RSP] is the exact user-mode return IP.
-     */
-    if (!env->regs[R_R8] ||
-        !vmbp_read_u64(walk, env->regs[R_ESP], &return_ip) ||
-        !return_ip || return_ip >= VMBP_USER_END ||
-        !vmbp_translate(walk, return_ip, &pa, &executable) || !executable) {
-        if (vmbp_map_miss_logs++ < 8) {
-            fprintf(stderr, "vmport-bp: map-entry unusable vcpu=%d cr3=0x%" PRIx64
-                            " r8=0x%" PRIx64 " rsp=0x%" PRIx64 "\n",
-                    cs->cpu_index, cr3, (uint64_t)env->regs[R_R8],
-                    (uint64_t)env->regs[R_ESP]);
-        }
-        env->eflags |= RF_MASK;
-        return true;
-    }
-
-    pending->map_base_ptr = env->regs[R_R8];
-    pending->map_return_ip = return_ip;
-    pending->expires_us = g_get_monotonic_time() + 2000000;
-    fprintf(stderr, "vmport-bp: map-entry target=%s cr3=0x%" PRIx64
-                    " base-out=0x%" PRIx64 " return=0x%" PRIx64 "\n",
-            vmbp_profiles[pending->profile].name, cr3,
-            pending->map_base_ptr, pending->map_return_ip);
-    vmbp_publish_debug_change();
-    env->eflags |= RF_MASK;
-    return true;
-}
-
-static bool vmbp_handle_map_return(X86CPU *cpu, struct kvm_sregs *sregs,
-                                   VmbpWalk *walk)
-{
-    CPUState *cs = CPU(cpu);
-    CPUX86State *env = &cpu->env;
-    uint64_t cr3 = sregs->cr3 & VMBP_PHYS_MASK;
-    VmbpPending *pending = vmbp_find_pending(cr3);
     uint64_t base = 0;
     int site;
 
-    if (!pending) {
+    if (pending_index >= VMBP_MAX_PENDING ||
+        !vmbp_pending[pending_index].active) {
+        env->eflags |= RF_MASK;
+        return true;
+    }
+    pending = &vmbp_pending[pending_index];
+
+    /* DR watchpoints are linear-address based and can theoretically collide
+     * with the same user VA in another process.  Only consume the write in
+     * the address space that issued the matching LdrLoadDll call.
+     */
+    if (pending->cr3 != cr3) {
         env->eflags |= RF_MASK;
         return true;
     }
 
-    if ((int32_t)env->regs[R_EAX] >= 0 && pending->map_base_ptr) {
-        (void)vmbp_read_u64(walk, pending->map_base_ptr, &base);
-    }
-    if ((!base || !vmbp_match_image(walk, pending->profile, base)) &&
-        pending->dll_handle_ptr) {
-        uint64_t handle_base = 0;
-        if (vmbp_read_u64(walk, pending->dll_handle_ptr, &handle_base) &&
-            vmbp_match_image(walk, pending->profile, handle_base)) {
-            base = handle_base;
-        }
-    }
-
-    if (base && vmbp_match_image(walk, pending->profile, base) &&
+    if (vmbp_read_u64(walk, pending->dll_handle_ptr, &base) && base &&
+        vmbp_match_image(walk, pending->profile, base) &&
         vmbp_match_site(walk, pending->profile,
                         base + vmbp_profiles[pending->profile].in_rva)) {
         site = vmbp_add_site(pending->profile, base);
-        fprintf(stderr, "vmport-bp: mapped %s base=0x%" PRIx64
-                        " in=0x%" PRIx64 " site=%d\n",
+        fprintf(stderr, "vmport-bp: handle-write mapped %s base=0x%" PRIx64
+                        " in=0x%" PRIx64 " site=%d cr3=0x%" PRIx64 "\n",
                 vmbp_profiles[pending->profile].name, base,
-                base + vmbp_profiles[pending->profile].in_rva, site);
+                base + vmbp_profiles[pending->profile].in_rva, site, cr3);
         pending->active = false;
         vmbp_publish_debug_change();
     } else {
-        if (vmbp_map_miss_logs++ < 12) {
-            fprintf(stderr, "vmport-bp: map-return vcpu=%d cr3=0x%" PRIx64
-                            " status=0x%08x base-out=0x%" PRIx64
-                            " value=0x%" PRIx64 " target=%s "
-                            "(not target mapping yet)\n",
-                    cs->cpu_index, cr3, (uint32_t)env->regs[R_EAX],
-                    pending->map_base_ptr, base,
-                    vmbp_profiles[pending->profile].name);
-        }
-        /* The target load can invoke NtMapViewOfSection more than once.
-         * Re-arm the entry hook and wait for the next mapping attempt.
-         */
-        pending->map_base_ptr = 0;
-        pending->map_return_ip = 0;
         pending->expires_us = g_get_monotonic_time() + 2000000;
-        vmbp_publish_debug_change();
+        if (vmbp_handle_miss_logs++ < 12) {
+            fprintf(stderr, "vmport-bp: handle-write target=%s cr3=0x%" PRIx64
+                            " handle-out=0x%" PRIx64 " value=0x%" PRIx64
+                            " (waiting for final module base)\n",
+                    vmbp_profiles[pending->profile].name, cr3,
+                    pending->dll_handle_ptr, base);
+        }
     }
 
     env->eflags |= RF_MASK;
@@ -1168,9 +1141,18 @@ static bool vmbp_handle_debug(X86CPU *cpu, struct kvm_debug_exit_arch *info)
         return false;
     }
     for (n = 0; n < 4; n++) {
-        if ((fired & (1U << n)) && cpu->vmport_bp.slot_ip[n] == info->pc &&
-            ((info->dr7 >> (16 + n * 4)) & 15) == 0 &&
-            cpu->vmport_bp.slot_kind[n] != VMBP_SLOT_NONE) {
+        unsigned rwlen;
+
+        if (!(fired & (1U << n)) ||
+            cpu->vmport_bp.slot_kind[n] == VMBP_SLOT_NONE) {
+            continue;
+        }
+        rwlen = (info->dr7 >> (16 + n * 4)) & 15;
+        if (cpu->vmport_bp.slot_kind[n] == VMBP_SLOT_DLL_HANDLE_WRITE) {
+            if (rwlen == 0x9) { /* write, 8 bytes */
+                break;
+            }
+        } else if (rwlen == 0 && cpu->vmport_bp.slot_ip[n] == info->pc) {
             break;
         }
     }
@@ -1204,13 +1186,12 @@ static bool vmbp_handle_debug(X86CPU *cpu, struct kvm_debug_exit_arch *info)
     switch (cpu->vmport_bp.slot_kind[n]) {
     case VMBP_SLOT_LDR_LOAD_DLL:
         return vmbp_handle_ldr_load(cpu, &sregs, &walk);
-    case VMBP_SLOT_NT_MAP_ENTRY:
-        return vmbp_handle_map_entry(cpu, &sregs, &walk);
-    case VMBP_SLOT_NT_MAP_RETURN:
-        return vmbp_handle_map_return(cpu, &sregs, &walk);
+    case VMBP_SLOT_DLL_HANDLE_WRITE:
+        return vmbp_handle_handle_write(cpu, &sregs, &walk,
+                                        cpu->vmport_bp.slot_index[n]);
     case VMBP_SLOT_VMPORT:
         return vmbp_handle_vmport(cpu, &sregs, &walk,
-                                  cpu->vmport_bp.slot_site[n], info);
+                                  cpu->vmport_bp.slot_index[n], info);
     default:
         return false;
     }
@@ -1251,7 +1232,7 @@ CPU_FIELDS = """
         unsigned generation;
         unsigned slot_mask;
         uint8_t slot_kind[4];
-        uint32_t slot_site[4];
+        uint32_t slot_index[4];
         uint64_t slot_ip[4];
         uint64_t hits;
         uint64_t rejects;
@@ -1301,7 +1282,7 @@ def main() -> int:
             (kvm_path.parent / name).write_text((here / name).read_text())
         kvm_path.write_text(kvm)
         cpu_path.write_text(cpu)
-        print("Installed LSTAR-bootstrap loader-triggered vmport breakpoints; no recurring scan")
+        print("Installed LSTAR/handle-watch loader-triggered vmport breakpoints; no recurring scan")
         return 0
     except (OSError, ValueError) as exc:
         print(f"FAIL: {exc}", file=sys.stderr)
@@ -1447,7 +1428,7 @@ RUN <<'EOF_BUILD'
     }
   done
 
-  strings /out/qemu-system-x86_64 | grep -Fq 'vmport-bp: LSTAR-bootstrap x64 UMD breakpoints enabled;' || {
+  strings /out/qemu-system-x86_64 | grep -Fq 'vmport-bp: LSTAR/handle-watch x64 UMD breakpoints enabled;' || {
     echo "FAIL: experimental vmport breakpoint code was not compiled in."
     exit 1
   }
