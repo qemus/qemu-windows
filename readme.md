@@ -52,7 +52,7 @@ The build currently combines:
 
 The repository builds a Linux `qemu-system-x86_64` binary through GitHub Actions and publishes it with each release.
 
-The build is intentionally reproducible around a upstream QEMU version 11.1.0 while external graphics components are integrated during the Docker build.
+The build is intentionally reproducible around upstream QEMU v11.1.0 while external graphics components are integrated during the Docker build.
 
 Prebuilt binaries are available from the [releases][release_url] page.
 
