@@ -490,7 +490,7 @@ static void vmbp_initialize(void)
     }
     /* This experimental build defaults on, but only with a vmport device. */
     if ((setting && strcmp(setting, "1")) ||
-        !object_resolve_path_type("vmport", NULL)) {
+        !object_resolve_path_type("", "vmport", NULL)) {
         qatomic_set(&vmbp_initialized, true);
         return;
     }
