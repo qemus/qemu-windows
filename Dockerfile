@@ -127,12 +127,12 @@ RUN <<'EOF_PATCHES'
     git -C /src/qemu apply --recount "$patch"
   done
 
-  # Allow VMware user-mode display drivers to reach the VMware backdoor ports
-  # on x64 Windows without requiring the host-wide KVM vmware_backdoor option.
-  # The active Windows x64 TSS normally has no I/O bitmap (limit 0x67) while
-  # IoMapBase is 0x68. Install a deny-by-default bitmap immediately after the
-  # TSS, permit only the four ports consumed by a 32-bit access at 0x5658, and
-  # extend the cached task-register limit so the processor consults that map.
+  # Allow VMware user-mode display drivers on x64 Windows to reach the VMware
+  # backdoor ports without requiring the host-wide KVM vmware_backdoor option.
+  # Activation is event-driven by the first successful KVM I/O exit at 0x5658.
+  # Each x64 vCPU then installs a deny-by-default TSS I/O bitmap, permitting only
+  # 0x5658-0x565b. This diagnostic build characterizes the candidate memory before
+  # writing, verifies readback, and samples the installed TSS state once per second.
   python3 - <<'EOF_VMPORT_TSS'
 from pathlib import Path
 
@@ -147,6 +147,143 @@ helper = '''#define KVM_VMPORT_TSS_ORIGINAL_LIMIT 0x0067
 #define KVM_VMPORT_TSS_IOMAP_LIMIT    0x0b34
 #define KVM_VMPORT_TSS_IOMAP_BYTES    (KVM_VMPORT_TSS_IOMAP_LIMIT - KVM_VMPORT_TSS_IOMAP_BASE + 1)
 #define KVM_VMPORT_TSS_VMWARE_BYTE    (0x5658 >> 3)
+#define KVM_VMPORT_TSS_OBSERVE_US     1000000LL
+
+static int kvm_vmport_tss_active;
+static int64_t kvm_vmport_tss_next_observe[256];
+static uint64_t kvm_vmport_tss_last_base[256];
+static uint32_t kvm_vmport_tss_last_limit[256];
+static uint16_t kvm_vmport_tss_last_iomap[256];
+static uint8_t kvm_vmport_tss_last_vmbyte[256];
+static uint32_t kvm_vmport_tss_observe_count[256];
+static uint8_t kvm_vmport_tss_observe_valid[256];
+
+static void kvm_vmport_tss_activate(CPUState *trigger_cpu,
+                                    struct kvm_run *run)
+{
+    CPUState *cs;
+
+    if (qatomic_read(&kvm_vmport_tss_active) ||
+        run->exit_reason != KVM_EXIT_IO || run->io.port != 0x5658) {
+        return;
+    }
+
+    bql_lock();
+    if (!qatomic_read(&kvm_vmport_tss_active)) {
+        qatomic_set(&kvm_vmport_tss_active, 1);
+        fprintf(stderr,
+                "vmport-tss: activated by vcpu=%d KVM_EXIT_IO port=0x%04x "
+                "direction=%s size=%u count=%u\\n",
+                trigger_cpu->cpu_index, run->io.port,
+                run->io.direction == KVM_EXIT_IO_IN ? "in" : "out",
+                run->io.size, run->io.count);
+        CPU_FOREACH(cs) {
+            if (cs != trigger_cpu) {
+                qemu_cpu_kick(cs);
+            }
+        }
+    }
+    bql_unlock();
+}
+
+static bool kvm_vmport_tss_candidate_stats(CPUState *cs, uint64_t base,
+                                            uint8_t *before)
+{
+    uint64_t start = base + KVM_VMPORT_TSS_IOMAP_BASE;
+    uint64_t end = base + KVM_VMPORT_TSS_IOMAP_LIMIT;
+    size_t zero = 0, ff = 0, other = 0;
+    size_t first_other = SIZE_MAX, last_other = SIZE_MAX;
+    uint8_t first_value = 0, last_value = 0;
+    size_t i;
+    int ret;
+
+    ret = cpu_memory_rw_debug(cs, start, before,
+                              KVM_VMPORT_TSS_IOMAP_BYTES, false);
+    if (ret != 0) {
+        fprintf(stderr,
+                "vmport-tss: vcpu=%d reject=CANDIDATE_READ ret=%d "
+                "address=0x%" PRIx64 " size=0x%x\\n",
+                cs->cpu_index, ret, start,
+                KVM_VMPORT_TSS_IOMAP_BYTES);
+        return false;
+    }
+
+    for (i = 0; i < KVM_VMPORT_TSS_IOMAP_BYTES; i++) {
+        if (before[i] == 0x00) {
+            zero++;
+        } else if (before[i] == 0xff) {
+            ff++;
+        } else {
+            if (first_other == SIZE_MAX) {
+                first_other = i;
+                first_value = before[i];
+            }
+            last_other = i;
+            last_value = before[i];
+            other++;
+        }
+    }
+
+    fprintf(stderr,
+            "vmport-tss: vcpu=%d candidate base=0x%" PRIx64
+            " page-offset=0x%03" PRIx64 " range=0x%" PRIx64
+            "-0x%" PRIx64 " pages=%" PRIu64
+            " bytes=%u zero=%zu ff=%zu other=%zu",
+            cs->cpu_index, base, base & 0xfff, start, end,
+            (end >> 12) - (start >> 12) + 1,
+            KVM_VMPORT_TSS_IOMAP_BYTES, zero, ff, other);
+    if (other) {
+        fprintf(stderr,
+                " first-other=+0x%zx:0x%02x last-other=+0x%zx:0x%02x",
+                first_other, first_value, last_other, last_value);
+    }
+    fputc('\\n', stderr);
+    return true;
+}
+
+static bool kvm_vmport_tss_verify_map(CPUState *cs, uint64_t base,
+                                       const uint8_t *expected,
+                                       const uint8_t *before)
+{
+    uint8_t verify[KVM_VMPORT_TSS_IOMAP_BYTES];
+    size_t i;
+    int ret;
+
+    ret = cpu_memory_rw_debug(cs, base + KVM_VMPORT_TSS_IOMAP_BASE,
+                              verify, sizeof(verify), false);
+    if (ret == 0 && memcmp(verify, expected, sizeof(verify)) == 0) {
+        fprintf(stderr,
+                "vmport-tss: vcpu=%d bitmap readback verified bytes=%zu "
+                "vmware-byte[+0x%x]=0x%02x\\n",
+                cs->cpu_index, sizeof(verify),
+                KVM_VMPORT_TSS_VMWARE_BYTE,
+                verify[KVM_VMPORT_TSS_VMWARE_BYTE]);
+        return true;
+    }
+
+    fprintf(stderr,
+            "vmport-tss: vcpu=%d reject=VERIFY_MAP ret=%d",
+            cs->cpu_index, ret);
+    if (ret == 0) {
+        for (i = 0; i < sizeof(verify); i++) {
+            if (verify[i] != expected[i]) {
+                fprintf(stderr,
+                        " first-mismatch=+0x%zx expected=0x%02x got=0x%02x",
+                        i, expected[i], verify[i]);
+                break;
+            }
+        }
+    }
+    fputc('\\n', stderr);
+
+    ret = cpu_memory_rw_debug(cs, base + KVM_VMPORT_TSS_IOMAP_BASE,
+                              (uint8_t *)before,
+                              KVM_VMPORT_TSS_IOMAP_BYTES, true);
+    fprintf(stderr,
+            "vmport-tss: vcpu=%d rollback candidate bytes ret=%d\\n",
+            cs->cpu_index, ret);
+    return false;
+}
 
 static void kvm_vmport_tss_enable_user_io(X86CPU *cpu)
 {
@@ -154,227 +291,167 @@ static void kvm_vmport_tss_enable_user_io(X86CPU *cpu)
     CPUX86State *env = &cpu->env;
     struct kvm_sregs sregs;
     uint8_t io_map_base[2];
+    uint8_t before[KVM_VMPORT_TSS_IOMAP_BYTES];
     uint8_t io_map[KVM_VMPORT_TSS_IOMAP_BYTES];
-    static uint32_t reject_seen[256];
-    static uint64_t last_tr_base[256];
-    static uint32_t last_tr_limit[256];
-    static uint8_t last_tr_type[256];
-    static uint8_t last_tr_present[256];
-    static uint8_t last_lma[256];
-    static uint8_t state_valid[256];
-    static uint16_t last_iomap[256];
-    static uint8_t iomap_valid[256];
-    uint32_t *seen = NULL;
-    unsigned int index = cs->cpu_index;
-    uint8_t lma;
     uint16_t iomap;
+    uint8_t lma;
+    unsigned int index = cs->cpu_index;
     int ret;
 
-    if (index < ARRAY_SIZE(reject_seen)) {
-        seen = &reject_seen[index];
-        if (!(*seen & (1U << 0))) {
-            *seen |= 1U << 0;
-            fprintf(stderr, "vmport-tss: vcpu=%d probe entered\\n",
-                    cs->cpu_index);
-        }
-    }
-
-    /* Fast path after this vCPU has already received the extended limit. */
     if (env->tr.limit == KVM_VMPORT_TSS_IOMAP_LIMIT) {
         return;
     }
 
     ret = kvm_vcpu_ioctl(cs, KVM_GET_SREGS, &sregs);
     if (ret < 0) {
-        if (!seen || !(*seen & (1U << 1))) {
-            if (seen) {
-                *seen |= 1U << 1;
-            }
-            fprintf(stderr,
-                    "vmport-tss: vcpu=%d reject=KVM_GET_SREGS ret=%d\\n",
-                    cs->cpu_index, ret);
-        }
+        fprintf(stderr,
+                "vmport-tss: vcpu=%d reject=KVM_GET_SREGS ret=%d\\n",
+                cs->cpu_index, ret);
         return;
     }
 
     lma = !!(sregs.efer & MSR_EFER_LMA);
-    if (index < ARRAY_SIZE(state_valid) &&
-        (!state_valid[index] || last_lma[index] != lma ||
-         last_tr_present[index] != sregs.tr.present ||
-         last_tr_type[index] != sregs.tr.type ||
-         last_tr_base[index] != sregs.tr.base ||
-         last_tr_limit[index] != sregs.tr.limit)) {
-        state_valid[index] = 1;
-        last_lma[index] = lma;
-        last_tr_present[index] = sregs.tr.present;
-        last_tr_type[index] = sregs.tr.type;
-        last_tr_base[index] = sregs.tr.base;
-        last_tr_limit[index] = sregs.tr.limit;
+    if (!lma || !sregs.tr.present || sregs.tr.type != 11 || !sregs.tr.base ||
+        sregs.tr.limit != KVM_VMPORT_TSS_ORIGINAL_LIMIT) {
         fprintf(stderr,
-                "vmport-tss: vcpu=%d state lma=%u present=%u type=%u "
-                "base=0x%" PRIx64 " limit=0x%x env-base=0x%" PRIx64
-                " env-limit=0x%x\\n",
+                "vmport-tss: vcpu=%d waiting lma=%u present=%u type=%u "
+                "base=0x%" PRIx64 " limit=0x%x\\n",
                 cs->cpu_index, lma, sregs.tr.present, sregs.tr.type,
-                (uint64_t)sregs.tr.base, sregs.tr.limit,
-                (uint64_t)env->tr.base, env->tr.limit);
-    }
-
-    /* Match the normal active 64-bit Windows TSS before changing anything. */
-    if (!lma) {
-        if (!seen || !(*seen & (1U << 2))) {
-            if (seen) {
-                *seen |= 1U << 2;
-            }
-            fprintf(stderr, "vmport-tss: vcpu=%d reject=NOT_LONG_MODE\\n",
-                    cs->cpu_index);
-        }
-        return;
-    }
-    if (!sregs.tr.present) {
-        if (!seen || !(*seen & (1U << 3))) {
-            if (seen) {
-                *seen |= 1U << 3;
-            }
-            fprintf(stderr, "vmport-tss: vcpu=%d reject=TR_NOT_PRESENT\\n",
-                    cs->cpu_index);
-        }
-        return;
-    }
-    if (sregs.tr.type != 11) {
-        if (!seen || !(*seen & (1U << 4))) {
-            if (seen) {
-                *seen |= 1U << 4;
-            }
-            fprintf(stderr,
-                    "vmport-tss: vcpu=%d reject=TR_TYPE type=%u\\n",
-                    cs->cpu_index, sregs.tr.type);
-        }
-        return;
-    }
-    if (!sregs.tr.base) {
-        if (!seen || !(*seen & (1U << 5))) {
-            if (seen) {
-                *seen |= 1U << 5;
-            }
-            fprintf(stderr, "vmport-tss: vcpu=%d reject=TR_BASE_ZERO\\n",
-                    cs->cpu_index);
-        }
-        return;
-    }
-    if (sregs.tr.limit != KVM_VMPORT_TSS_ORIGINAL_LIMIT) {
-        if (!seen || !(*seen & (1U << 6))) {
-            if (seen) {
-                *seen |= 1U << 6;
-            }
-            fprintf(stderr,
-                    "vmport-tss: vcpu=%d reject=TR_LIMIT limit=0x%x "
-                    "expected=0x%x\\n",
-                    cs->cpu_index, sregs.tr.limit,
-                    KVM_VMPORT_TSS_ORIGINAL_LIMIT);
-        }
+                (uint64_t)sregs.tr.base, sregs.tr.limit);
         return;
     }
 
-    /* Synchronize CR3 and the segment state used by cpu_memory_rw_debug(). */
     kvm_cpu_synchronize_state(cs);
-    if (env->tr.base != sregs.tr.base) {
-        if (!seen || !(*seen & (1U << 7))) {
-            if (seen) {
-                *seen |= 1U << 7;
-            }
-            fprintf(stderr,
-                    "vmport-tss: vcpu=%d reject=SYNC_BASE kvm=0x%" PRIx64
-                    " env=0x%" PRIx64 "\\n",
-                    cs->cpu_index, (uint64_t)sregs.tr.base,
-                    (uint64_t)env->tr.base);
-        }
-        return;
-    }
-    if (env->tr.limit != KVM_VMPORT_TSS_ORIGINAL_LIMIT) {
-        if (!seen || !(*seen & (1U << 8))) {
-            if (seen) {
-                *seen |= 1U << 8;
-            }
-            fprintf(stderr,
-                    "vmport-tss: vcpu=%d reject=SYNC_LIMIT kvm=0x%x "
-                    "env=0x%x\\n",
-                    cs->cpu_index, sregs.tr.limit, env->tr.limit);
-        }
+    if (env->tr.base != sregs.tr.base ||
+        env->tr.limit != KVM_VMPORT_TSS_ORIGINAL_LIMIT) {
+        fprintf(stderr,
+                "vmport-tss: vcpu=%d reject=SYNC_TR kvm-base=0x%" PRIx64
+                " env-base=0x%" PRIx64 " kvm-limit=0x%x env-limit=0x%x\\n",
+                cs->cpu_index, (uint64_t)sregs.tr.base,
+                (uint64_t)env->tr.base, sregs.tr.limit, env->tr.limit);
         return;
     }
 
     ret = cpu_memory_rw_debug(cs, env->tr.base + 0x66, io_map_base,
                               sizeof(io_map_base), false);
     if (ret != 0) {
-        if (!seen || !(*seen & (1U << 9))) {
-            if (seen) {
-                *seen |= 1U << 9;
-            }
-            fprintf(stderr,
-                    "vmport-tss: vcpu=%d reject=IOMAP_READ ret=%d "
-                    "address=0x%" PRIx64 "\\n",
-                    cs->cpu_index, ret, (uint64_t)env->tr.base + 0x66);
-        }
+        fprintf(stderr,
+                "vmport-tss: vcpu=%d reject=IOMAP_READ ret=%d "
+                "address=0x%" PRIx64 "\\n",
+                cs->cpu_index, ret, (uint64_t)env->tr.base + 0x66);
         return;
     }
 
     iomap = io_map_base[0] | ((uint16_t)io_map_base[1] << 8);
-    if (index < ARRAY_SIZE(iomap_valid) &&
-        (!iomap_valid[index] || last_iomap[index] != iomap)) {
-        iomap_valid[index] = 1;
-        last_iomap[index] = iomap;
-        fprintf(stderr,
-                "vmport-tss: vcpu=%d iomap-base=0x%04x at 0x%" PRIx64
-                "\\n",
-                cs->cpu_index, iomap, (uint64_t)env->tr.base + 0x66);
-    }
     if (iomap != KVM_VMPORT_TSS_IOMAP_BASE) {
-        if (!seen || !(*seen & (1U << 10))) {
-            if (seen) {
-                *seen |= 1U << 10;
-            }
-            fprintf(stderr,
-                    "vmport-tss: vcpu=%d reject=IOMAP_BASE value=0x%04x "
-                    "expected=0x%04x\\n",
-                    cs->cpu_index, iomap, KVM_VMPORT_TSS_IOMAP_BASE);
-        }
+        fprintf(stderr,
+                "vmport-tss: vcpu=%d reject=IOMAP_BASE value=0x%04x "
+                "expected=0x%04x\\n",
+                cs->cpu_index, iomap, KVM_VMPORT_TSS_IOMAP_BASE);
+        return;
+    }
+
+    if (!kvm_vmport_tss_candidate_stats(cs, env->tr.base, before)) {
         return;
     }
 
     memset(io_map, 0xff, sizeof(io_map));
-
-    /*
-     * A 32-bit IN/OUT at 0x5658 checks ports 0x5658 through 0x565b.
-     * 0x5659, used by VMware's high-bandwidth transport, is included too.
-     */
     io_map[KVM_VMPORT_TSS_VMWARE_BYTE] = 0xf0;
 
     ret = cpu_memory_rw_debug(cs,
                               env->tr.base + KVM_VMPORT_TSS_IOMAP_BASE,
                               io_map, sizeof(io_map), true);
     if (ret != 0) {
-        if (!seen || !(*seen & (1U << 11))) {
-            if (seen) {
-                *seen |= 1U << 11;
-            }
-            fprintf(stderr,
-                    "vmport-tss: vcpu=%d reject=IOMAP_WRITE ret=%d "
-                    "address=0x%" PRIx64 " size=0x%zx\\n",
-                    cs->cpu_index, ret,
-                    (uint64_t)env->tr.base + KVM_VMPORT_TSS_IOMAP_BASE,
-                    sizeof(io_map));
-        }
+        fprintf(stderr,
+                "vmport-tss: vcpu=%d reject=IOMAP_WRITE ret=%d "
+                "address=0x%" PRIx64 " size=0x%zx\\n",
+                cs->cpu_index, ret,
+                (uint64_t)env->tr.base + KVM_VMPORT_TSS_IOMAP_BASE,
+                sizeof(io_map));
+        return;
+    }
+
+    if (!kvm_vmport_tss_verify_map(cs, env->tr.base, io_map, before)) {
         return;
     }
 
     env->tr.limit = KVM_VMPORT_TSS_IOMAP_LIMIT;
+    if (index < ARRAY_SIZE(kvm_vmport_tss_next_observe)) {
+        kvm_vmport_tss_next_observe[index] =
+            g_get_monotonic_time() + KVM_VMPORT_TSS_OBSERVE_US;
+    }
 
     fprintf(stderr,
             "vmport-tss: vcpu=%d enabled user I/O 0x5658-0x565b "
-            "at TSS 0x%" PRIx64 "\\n",
-            cs->cpu_index, (uint64_t)env->tr.base);
+            "at TSS 0x%" PRIx64 " limit=0x%x\\n",
+            cs->cpu_index, (uint64_t)env->tr.base,
+            KVM_VMPORT_TSS_IOMAP_LIMIT);
 }
 
+static void kvm_vmport_tss_observe(X86CPU *cpu)
+{
+    CPUState *cs = CPU(cpu);
+    struct kvm_sregs sregs;
+    uint8_t io_map_base[2];
+    uint8_t vmbyte = 0;
+    uint16_t iomap = 0xffff;
+    unsigned int index = cs->cpu_index;
+    int64_t now;
+    bool changed;
+    int ret;
+
+    if (index >= ARRAY_SIZE(kvm_vmport_tss_next_observe)) {
+        return;
+    }
+    now = g_get_monotonic_time();
+    if (now < kvm_vmport_tss_next_observe[index]) {
+        return;
+    }
+    kvm_vmport_tss_next_observe[index] = now + KVM_VMPORT_TSS_OBSERVE_US;
+
+    ret = kvm_vcpu_ioctl(cs, KVM_GET_SREGS, &sregs);
+    if (ret < 0) {
+        fprintf(stderr,
+                "vmport-tss: observe vcpu=%d KVM_GET_SREGS ret=%d\\n",
+                cs->cpu_index, ret);
+        return;
+    }
+
+    kvm_cpu_synchronize_state(cs);
+    ret = cpu_memory_rw_debug(cs, sregs.tr.base + 0x66,
+                              io_map_base, sizeof(io_map_base), false);
+    if (ret == 0) {
+        iomap = io_map_base[0] | ((uint16_t)io_map_base[1] << 8);
+        ret = cpu_memory_rw_debug(
+            cs, sregs.tr.base + KVM_VMPORT_TSS_IOMAP_BASE +
+                    KVM_VMPORT_TSS_VMWARE_BYTE,
+            &vmbyte, sizeof(vmbyte), false);
+    }
+
+    changed = !kvm_vmport_tss_observe_valid[index] ||
+              kvm_vmport_tss_last_base[index] != sregs.tr.base ||
+              kvm_vmport_tss_last_limit[index] != sregs.tr.limit ||
+              kvm_vmport_tss_last_iomap[index] != iomap ||
+              kvm_vmport_tss_last_vmbyte[index] != vmbyte;
+    kvm_vmport_tss_observe_count[index]++;
+
+    if (changed || (kvm_vmport_tss_observe_count[index] % 10) == 0) {
+        fprintf(stderr,
+                "vmport-tss: observe vcpu=%d sample=%u base=0x%" PRIx64
+                " limit=0x%x iomap=0x%04x vmware-byte=0x%02x read-ret=%d%s\\n",
+                cs->cpu_index, kvm_vmport_tss_observe_count[index],
+                (uint64_t)sregs.tr.base, sregs.tr.limit, iomap, vmbyte, ret,
+                (sregs.tr.limit == KVM_VMPORT_TSS_IOMAP_LIMIT &&
+                 iomap == KVM_VMPORT_TSS_IOMAP_BASE && vmbyte == 0xf0) ?
+                    " stable" : " CHANGED");
+    }
+
+    kvm_vmport_tss_observe_valid[index] = 1;
+    kvm_vmport_tss_last_base[index] = sregs.tr.base;
+    kvm_vmport_tss_last_limit[index] = sregs.tr.limit;
+    kvm_vmport_tss_last_iomap[index] = iomap;
+    kvm_vmport_tss_last_vmbyte[index] = vmbyte;
+}
 '''
 
 post_run_anchor = '''MemTxAttrs kvm_arch_post_run(CPUState *cpu, struct kvm_run *run)
@@ -387,9 +464,20 @@ post_run_replacement = '''MemTxAttrs kvm_arch_post_run(CPUState *cpu, struct kvm
     X86CPU *x86_cpu = X86_CPU(cpu);
     CPUX86State *env = &x86_cpu->env;
 
-    bql_lock();
-    kvm_vmport_tss_enable_user_io(x86_cpu);
-    bql_unlock();
+    kvm_vmport_tss_activate(cpu, run);
+    if (qatomic_read(&kvm_vmport_tss_active)) {
+        if (env->tr.limit != KVM_VMPORT_TSS_IOMAP_LIMIT) {
+            bql_lock();
+            kvm_vmport_tss_enable_user_io(x86_cpu);
+            bql_unlock();
+        } else if (cpu->cpu_index < ARRAY_SIZE(kvm_vmport_tss_next_observe) &&
+                   g_get_monotonic_time() >=
+                       kvm_vmport_tss_next_observe[cpu->cpu_index]) {
+            bql_lock();
+            kvm_vmport_tss_observe(x86_cpu);
+            bql_unlock();
+        }
+    }
 '''
 
 if text.count(helper_anchor) != 1:
