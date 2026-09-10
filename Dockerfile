@@ -127,6 +127,9 @@ RUN <<'EOF_PATCHES'
     git -C /src/qemu apply --recount "$patch"
   done
 
+  # VMware user-mode vmport compatibility is maintained as
+  # patches/0004-vmport-tss-user-io.patch and is applied by the loop above.
+
   git -C /src/qemu diff --check
 EOF_PATCHES
 
@@ -259,6 +262,11 @@ RUN <<'EOF_BUILD'
       exit 1
     }
   done
+
+  strings /out/qemu-system-x86_64 | grep -Fq 'vmport-tss: armed, probing every KVM exit for x64 TSS' || {
+    echo "FAIL: stable x64 vmport TSS compatibility code was not compiled in."
+    exit 1
+  }
 
 EOF_BUILD
 
