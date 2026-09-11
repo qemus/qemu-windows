@@ -138,7 +138,7 @@ diff --git a/hw/i386/vmport.c b/hw/i386/vmport.c
 +static void vmport_guestrpc_finish_request(VMPortGuestRPCChannel *channel)
 +{
 +    static const char success_reply[] = "1 ";
-+    static const char build_type_reply[] = "1 debug";
++    static const char build_type_reply[] = "1 release";
 +    static const char miniport_logging_reply[] = "1 TRUE";
 +    static const char present_loglevel_reply[] = "1 9";
 +    static const char miniport_loglevel_reply[] = "1 9";
