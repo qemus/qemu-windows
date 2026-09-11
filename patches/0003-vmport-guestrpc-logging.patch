@@ -30,7 +30,7 @@ diff --git a/hw/i386/vmport.c b/hw/i386/vmport.c
 +    uint8_t *request;
 +    uint32_t request_size;
 +    uint32_t request_pos;
-+    const char *reply;
++    char *reply;
 +    uint32_t reply_size;
 +    uint32_t reply_pos;
 +} VMPortGuestRPCChannel;
@@ -38,16 +38,17 @@ diff --git a/hw/i386/vmport.c b/hw/i386/vmport.c
  /* Compatibility flags for migration */
  #define VMPORT_COMPAT_READ_SET_EAX_BIT              0
  #define VMPORT_COMPAT_SIGNAL_UNSUPPORTED_CMD_BIT    1
-@@ -76,6 +106,8 @@ struct VMPortState {
+@@ -76,6 +106,9 @@
      uint8_t vmware_vmx_type;
  
      uint32_t compat_flags;
 +
 +    VMPortGuestRPCChannel guestrpc[VMPORT_GUESTRPC_MAX_CHANNELS];
++    GHashTable *guestinfo;
  };
  
  static VMPortState *port_state;
-@@ -154,6 +186,252 @@ static void vmport_ioport_write(void *opaque, hwaddr addr,
+@@ -154,6 +187,339 @@ static VMPortState *port_state;
      cpu->env.regs[R_EAX] = vmport_ioport_read(opaque, addr, 4);
  }
  
@@ -76,6 +77,7 @@ diff --git a/hw/i386/vmport.c b/hw/i386/vmport.c
 +static void vmport_guestrpc_reset_channel(VMPortGuestRPCChannel *channel)
 +{
 +    g_free(channel->request);
++    g_free(channel->reply);
 +    memset(channel, 0, sizeof(*channel));
 +}
 +
@@ -132,64 +134,111 @@ diff --git a/hw/i386/vmport.c b/hw/i386/vmport.c
 +    g_string_free(line, true);
 +}
 +
-+static void vmport_guestrpc_finish_request(VMPortGuestRPCChannel *channel)
++static void vmport_guestrpc_print_reply(const char *reply, size_t size)
 +{
-+    static const char success_reply[] = "1 ";
-+    static const char build_type_reply[] = "1 release";
-+    static const char miniport_logging_reply[] = "1 TRUE";
-+    static const char present_loglevel_reply[] = "1 9";
-+    static const char miniport_loglevel_reply[] = "1 9";
-+    static const char vsync_reply[] = "1 FALSE";
-+    static const char unknown_reply[] = "0 Unknown command";
++    GString *line = vmport_guestrpc_format_line("vmport-rpc-reply: ",
++                                                 (const uint8_t *)reply, size);
++
++    fprintf(stderr, "%s\n", line->str);
++    fflush(stderr);
++    g_string_free(line, true);
++}
++
++static void vmport_guestrpc_set_reply(VMPortGuestRPCChannel *channel,
++                                       char *reply)
++{
++    g_free(channel->reply);
++    channel->reply = reply;
++    channel->reply_size = strlen(reply);
++    channel->reply_pos = 0;
++}
++
++static const char *vmport_guestrpc_guestinfo_override(const char *key)
++{
++    if (!strcmp(key, "guestinfo.svga.wddm.buildType")) {
++        return "debug";
++    }
++    if (!strcmp(key, "guestinfo.svga.wddm.miniportLogging")) {
++        return "TRUE";
++    }
++    if (!strcmp(key, "guestinfo.loglevel.vm3d.present")) {
++        return "9";
++    }
++    if (!strcmp(key, "guestinfo.loglevel.vm3d.miniport")) {
++        return "9";
++    }
++    if (!strcmp(key, "guestinfo.svga.wddm.enableVSync")) {
++        return "FALSE";
++    }
++    return NULL;
++}
++
++static void vmport_guestrpc_finish_request(VMPortState *s,
++                                            VMPortGuestRPCChannel *channel)
++{
++    static const char info_get_prefix[] = "info-get ";
++    static const char info_set_prefix[] = "info-set ";
++    char *request;
++    const char *key;
++    const char *value;
++    const char *separator;
 +
 +    vmport_guestrpc_print_rpc(channel->request, channel->request_size);
 +
-+    if (channel->request_size ==
-+            sizeof("info-get guestinfo.svga.wddm.buildType") - 1 &&
-+        !memcmp(channel->request,
-+                "info-get guestinfo.svga.wddm.buildType",
-+                sizeof("info-get guestinfo.svga.wddm.buildType") - 1)) {
-+        channel->reply = build_type_reply;
-+        channel->reply_size = sizeof(build_type_reply) - 1;
-+    } else if (channel->request_size ==
-+                   sizeof("info-get guestinfo.svga.wddm.miniportLogging") - 1 &&
-+               !memcmp(channel->request,
-+                       "info-get guestinfo.svga.wddm.miniportLogging",
-+                       sizeof("info-get guestinfo.svga.wddm.miniportLogging") - 1)) {
-+        channel->reply = miniport_logging_reply;
-+        channel->reply_size = sizeof(miniport_logging_reply) - 1;
-+    } else if (channel->request_size ==
-+                   sizeof("info-get guestinfo.loglevel.vm3d.present") - 1 &&
-+               !memcmp(channel->request,
-+                       "info-get guestinfo.loglevel.vm3d.present",
-+                       sizeof("info-get guestinfo.loglevel.vm3d.present") - 1)) {
-+        channel->reply = present_loglevel_reply;
-+        channel->reply_size = sizeof(present_loglevel_reply) - 1;
-+    } else if (channel->request_size ==
-+                   sizeof("info-get guestinfo.loglevel.vm3d.miniport") - 1 &&
-+               !memcmp(channel->request,
-+                       "info-get guestinfo.loglevel.vm3d.miniport",
-+                       sizeof("info-get guestinfo.loglevel.vm3d.miniport") - 1)) {
-+        channel->reply = miniport_loglevel_reply;
-+        channel->reply_size = sizeof(miniport_loglevel_reply) - 1;
-+    } else if (channel->request_size ==
-+                   sizeof("info-get guestinfo.svga.wddm.enableVSync") - 1 &&
-+               !memcmp(channel->request,
-+                       "info-get guestinfo.svga.wddm.enableVSync",
-+                       sizeof("info-get guestinfo.svga.wddm.enableVSync") - 1)) {
-+        channel->reply = vsync_reply;
-+        channel->reply_size = sizeof(vsync_reply) - 1;
++    if (channel->request_size) {
++        request = g_strndup((const char *)channel->request,
++                            channel->request_size);
++    } else {
++        request = g_strdup("");
++    }
++
++    if (g_str_has_prefix(request, info_get_prefix)) {
++        key = request + sizeof(info_get_prefix) - 1;
++        if (g_str_has_prefix(key, "guestinfo.")) {
++            value = vmport_guestrpc_guestinfo_override(key);
++            if (!value && s->guestinfo) {
++                value = g_hash_table_lookup(s->guestinfo, key);
++            }
++            if (value) {
++                vmport_guestrpc_set_reply(channel,
++                                          g_strdup_printf("1 %s", value));
++            } else {
++                vmport_guestrpc_set_reply(channel,
++                                          g_strdup("0 No value found"));
++            }
++        } else {
++            vmport_guestrpc_set_reply(channel,
++                                      g_strdup("0 Unknown command"));
++        }
++    } else if (g_str_has_prefix(request, info_set_prefix)) {
++        key = request + sizeof(info_set_prefix) - 1;
++        separator = strchr(key, ' ');
++        if (separator && separator != key &&
++            g_str_has_prefix(key, "guestinfo.")) {
++            char *stored_key = g_strndup(key, separator - key);
++
++            if (!s->guestinfo) {
++                s->guestinfo = g_hash_table_new_full(g_str_hash, g_str_equal,
++                                                      g_free, g_free);
++            }
++            g_hash_table_replace(s->guestinfo, stored_key,
++                                 g_strdup(separator + 1));
++            vmport_guestrpc_set_reply(channel, g_strdup("1 "));
++        } else {
++            vmport_guestrpc_set_reply(channel,
++                                      g_strdup("0 Unknown command"));
++        }
 +    } else if (channel->request_size >= 4 &&
 +               !memcmp(channel->request, "log ", 4)) {
 +        vmport_guestrpc_print_log(channel->request + 4,
 +                                  channel->request_size - 4);
-+        channel->reply = success_reply;
-+        channel->reply_size = sizeof(success_reply) - 1;
++        vmport_guestrpc_set_reply(channel, g_strdup("1 "));
 +    } else {
-+        channel->reply = unknown_reply;
-+        channel->reply_size = sizeof(unknown_reply) - 1;
++        vmport_guestrpc_set_reply(channel, g_strdup("0 Unknown command"));
 +    }
-+    channel->reply_pos = 0;
++
++    vmport_guestrpc_print_reply(channel->reply, channel->reply_size);
++    g_free(request);
 +}
 +
 +/*
@@ -245,6 +294,7 @@ diff --git a/hw/i386/vmport.c b/hw/i386/vmport.c
 +        }
 +
 +        g_free(channel->request);
++        g_free(channel->reply);
 +        channel->request = NULL;
 +        channel->request_size = value;
 +        channel->request_pos = 0;
@@ -259,7 +309,7 @@ diff --git a/hw/i386/vmport.c b/hw/i386/vmport.c
 +                return vmport_guestrpc_status(cpu, 0);
 +            }
 +        } else {
-+            vmport_guestrpc_finish_request(channel);
++            vmport_guestrpc_finish_request(s, channel);
 +        }
 +        return vmport_guestrpc_status(cpu, VMPORT_GUESTRPC_SUCCESS);
 +
@@ -277,7 +327,7 @@ diff --git a/hw/i386/vmport.c b/hw/i386/vmport.c
 +            channel->request[channel->request_pos++] = value >> (i * 8);
 +        }
 +        if (channel->request_pos == channel->request_size) {
-+            vmport_guestrpc_finish_request(channel);
++            vmport_guestrpc_finish_request(s, channel);
 +        }
 +        return vmport_guestrpc_status(cpu, VMPORT_GUESTRPC_SUCCESS);
 +
@@ -338,7 +388,7 @@ diff --git a/hw/i386/vmport.c b/hw/i386/vmport.c
  static uint32_t vmport_cmd_get_version(void *opaque, uint32_t addr)
  {
      X86CPU *cpu = X86_CPU(current_cpu);
-@@ -244,6 +522,7 @@ static void vmport_realizefn(DeviceState *dev, Error **errp)
+@@ -244,6 +610,7 @@ static uint32_t vmport_cmd_get_version(void *opaque, uint32_t addr)
      /* Register some generic port commands */
      vmport_register(VMPORT_CMD_GETVERSION, vmport_cmd_get_version, NULL);
      vmport_register(VMPORT_CMD_GETRAMSIZE, vmport_cmd_ram_size, NULL);
@@ -349,7 +399,7 @@ diff --git a/hw/i386/vmport.c b/hw/i386/vmport.c
 diff --git a/include/hw/i386/vmport.h b/include/hw/i386/vmport.h
 --- a/include/hw/i386/vmport.h
 +++ b/include/hw/i386/vmport.h
-@@ -10,6 +10,7 @@ typedef enum {
+@@ -10,6 +10,7 @@
      VMPORT_CMD_GETVERSION       = 10,
      VMPORT_CMD_GETBIOSUUID      = 19,
      VMPORT_CMD_GETRAMSIZE       = 20,
