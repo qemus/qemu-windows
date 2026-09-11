@@ -263,7 +263,7 @@ RUN <<'EOF_BUILD'
     }
   done
 
-  strings /out/qemu-system-x86_64 | grep -Fq 'probing x64 TSS every 10 ms for 5 s' || {
+  strings /out/qemu-system-x86_64 | grep -Fq 'immediate all-vcpu probe, retries every 10 ms for 5 s' || {
     echo "FAIL: gated/event-triggered x64 vmport TSS compatibility code was not compiled in."
     exit 1
   }
