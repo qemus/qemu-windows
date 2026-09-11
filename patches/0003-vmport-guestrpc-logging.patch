@@ -39,17 +39,19 @@ index 6f40eff..b46466e 100644
  /* Compatibility flags for migration */
  #define VMPORT_COMPAT_READ_SET_EAX_BIT              0
  #define VMPORT_COMPAT_SIGNAL_UNSUPPORTED_CMD_BIT    1
-@@ -76,6 +106,9 @@
+@@ -76,6 +106,11 @@
      uint8_t vmware_vmx_type;
  
      uint32_t compat_flags;
 +
 +    VMPortGuestRPCChannel guestrpc[VMPORT_GUESTRPC_MAX_CHANNELS];
 +    GHashTable *guestinfo;
++    bool guestrpc_debug_resolved;
++    bool guestrpc_debug_enabled;
  };
  
  static VMPortState *port_state;
-@@ -154,6 +187,343 @@ static VMPortState *port_state;
+@@ -154,6 +189,368 @@ static VMPortState *port_state;
      cpu->env.regs[R_EAX] = vmport_ioport_read(opaque, addr, 4);
  }
  
@@ -80,6 +82,25 @@ index 6f40eff..b46466e 100644
 +    g_free(channel->request);
 +    g_free(channel->reply);
 +    memset(channel, 0, sizeof(*channel));
++}
++
++static bool vmport_guestrpc_debug_enabled(VMPortState *s)
++{
++    Object *vmvga;
++
++    if (s->guestrpc_debug_resolved) {
++        return s->guestrpc_debug_enabled;
++    }
++
++    vmvga = object_resolve_path_type("", "vmvga", NULL);
++    if (!vmvga) {
++        return false;
++    }
++
++    s->guestrpc_debug_enabled =
++        object_property_get_bool(vmvga, "debug", NULL);
++    s->guestrpc_debug_resolved = true;
++    return s->guestrpc_debug_enabled;
 +}
 +
 +static GString *vmport_guestrpc_format_line(const char *prefix,
@@ -115,8 +136,13 @@ index 6f40eff..b46466e 100644
 +    return line;
 +}
 +
-+static void vmport_guestrpc_print_log(const uint8_t *message, size_t size)
++static void vmport_guestrpc_print_log(VMPortState *s,
++                                        const uint8_t *message, size_t size)
 +{
++    if (!vmport_guestrpc_debug_enabled(s)) {
++        return;
++    }
++
 +    GString *line = vmport_guestrpc_format_line("vmport-log: ",
 +                                                 message, size);
 +
@@ -125,8 +151,13 @@ index 6f40eff..b46466e 100644
 +    g_string_free(line, true);
 +}
 +
-+static void vmport_guestrpc_print_rpc(const uint8_t *message, size_t size)
++static void vmport_guestrpc_print_rpc(VMPortState *s,
++                                        const uint8_t *message, size_t size)
 +{
++    if (!vmport_guestrpc_debug_enabled(s)) {
++        return;
++    }
++
 +    GString *line = vmport_guestrpc_format_line("vmport-rpc: ",
 +                                                 message, size);
 +
@@ -135,8 +166,13 @@ index 6f40eff..b46466e 100644
 +    g_string_free(line, true);
 +}
 +
-+static void vmport_guestrpc_print_reply(const char *reply, size_t size)
++static void vmport_guestrpc_print_reply(VMPortState *s,
++                                          const char *reply, size_t size)
 +{
++    if (!vmport_guestrpc_debug_enabled(s)) {
++        return;
++    }
++
 +    GString *line = vmport_guestrpc_format_line("vmport-rpc-reply: ",
 +                                                 (const uint8_t *)reply, size);
 +
@@ -181,7 +217,8 @@ index 6f40eff..b46466e 100644
 +    }
 +
 +    if (!g_str_has_prefix(request, "log ")) {
-+        vmport_guestrpc_print_rpc(channel->request, channel->request_size);
++        vmport_guestrpc_print_rpc(s, channel->request,
++                                  channel->request_size);
 +    }
 +
 +    if (g_str_has_prefix(request, info_get_prefix)) {
@@ -222,7 +259,7 @@ index 6f40eff..b46466e 100644
 +        }
 +    } else if (channel->request_size >= 4 &&
 +               !memcmp(channel->request, "log ", 4)) {
-+        vmport_guestrpc_print_log(channel->request + 4,
++        vmport_guestrpc_print_log(s, channel->request + 4,
 +                                  channel->request_size - 4);
 +        vmport_guestrpc_set_reply(channel, g_strdup("1 "));
 +    } else {
@@ -230,7 +267,8 @@ index 6f40eff..b46466e 100644
 +    }
 +
 +    if (!g_str_has_prefix(request, "log ")) {
-+        vmport_guestrpc_print_reply(channel->reply, channel->reply_size);
++        vmport_guestrpc_print_reply(s, channel->reply,
++                                    channel->reply_size);
 +    }
 +    g_free(request);
 +}
@@ -382,7 +420,7 @@ index 6f40eff..b46466e 100644
  static uint32_t vmport_cmd_get_version(void *opaque, uint32_t addr)
  {
      X86CPU *cpu = X86_CPU(current_cpu);
-@@ -244,6 +614,7 @@ static uint32_t vmport_cmd_get_version(void *opaque, uint32_t addr)
+@@ -244,6 +641,7 @@ static uint32_t vmport_cmd_get_version(void *opaque, uint32_t addr)
      /* Register some generic port commands */
      vmport_register(VMPORT_CMD_GETVERSION, vmport_cmd_get_version, NULL);
      vmport_register(VMPORT_CMD_GETRAMSIZE, vmport_cmd_ram_size, NULL);
