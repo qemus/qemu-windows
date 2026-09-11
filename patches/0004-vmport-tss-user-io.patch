@@ -1,7 +1,7 @@
 diff --git a/target/i386/kvm/kvm.c b/target/i386/kvm/kvm.c
 --- a/target/i386/kvm/kvm.c
 +++ b/target/i386/kvm/kvm.c
-@@ -5985,6 +5985,350 @@
+@@ -5985,6 +5985,423 @@
      }
  }
  
@@ -128,6 +128,75 @@ diff --git a/target/i386/kvm/kvm.c b/target/i386/kvm/kvm.c
 +    }
 +}
 +
++static bool kvm_vmport_tss_validate_unused_map_area(CPUState *cs,
++                                                    uint64_t base)
++{
++    uint8_t first[KVM_VMPORT_TSS_IOMAP_BYTES];
++    uint8_t second[KVM_VMPORT_TSS_IOMAP_BYTES];
++    size_t i;
++    int ret;
++
++    /*
++     * The architectural TSS currently ends at +0x67.  Extending its limit to
++     * include an I/O bitmap is only safe for this compatibility experiment if
++     * the prospective bitmap storage immediately following the TSS is unused.
++     * Sample the entire region twice without resuming the guest.
++     */
++    ret = cpu_memory_rw_debug(cs, base + KVM_VMPORT_TSS_IOMAP_BASE,
++                              first, sizeof(first), false);
++    if (ret != 0) {
++        KVM_VMPORT_TSS_LOG(
++                "vmport-tss: vcpu=%d reject=IOMAP_AREA_READ1 ret=%d "
++                "address=0x%" PRIx64 " size=0x%zx\n",
++                cs->cpu_index, ret,
++                base + KVM_VMPORT_TSS_IOMAP_BASE, sizeof(first));
++        return false;
++    }
++
++    ret = cpu_memory_rw_debug(cs, base + KVM_VMPORT_TSS_IOMAP_BASE,
++                              second, sizeof(second), false);
++    if (ret != 0) {
++        KVM_VMPORT_TSS_LOG(
++                "vmport-tss: vcpu=%d reject=IOMAP_AREA_READ2 ret=%d "
++                "address=0x%" PRIx64 " size=0x%zx\n",
++                cs->cpu_index, ret,
++                base + KVM_VMPORT_TSS_IOMAP_BASE, sizeof(second));
++        return false;
++    }
++
++    if (memcmp(first, second, sizeof(first)) != 0) {
++        if (unlikely(qatomic_read(&kvm_vmport_tss_debug))) {
++            for (i = 0; i < sizeof(first); i++) {
++                if (first[i] != second[i]) {
++                    fprintf(stderr,
++                            "vmport-tss: vcpu=%d "
++                            "reject=IOMAP_AREA_UNSTABLE offset=+0x%zx "
++                            "first=0x%02x second=0x%02x\n",
++                            cs->cpu_index, i, first[i], second[i]);
++                    break;
++                }
++            }
++        }
++        return false;
++    }
++
++    for (i = 0; i < sizeof(first); i++) {
++        if (first[i] != 0) {
++            KVM_VMPORT_TSS_LOG(
++                    "vmport-tss: vcpu=%d reject=IOMAP_AREA_IN_USE "
++                    "offset=+0x%zx value=0x%02x\n",
++                    cs->cpu_index, i, first[i]);
++            return false;
++        }
++    }
++
++    KVM_VMPORT_TSS_LOG(
++            "vmport-tss: vcpu=%d prospective bitmap area verified "
++            "unused bytes=%zu\n",
++            cs->cpu_index, sizeof(first));
++    return true;
++}
++
 +static bool kvm_vmport_tss_verify_map(CPUState *cs, uint64_t base,
 +                                      const uint8_t *expected)
 +{
@@ -251,6 +320,10 @@ diff --git a/target/i386/kvm/kvm.c b/target/i386/kvm/kvm.c
 +    iomap2 = io_map_base2[0] | ((uint16_t)io_map_base2[1] << 8);
 +    if (iomap2 != iomap) {
 +        kvm_vmport_tss_diag(cs, &second, iomap2, "unstable-iomap-base");
++        return;
++    }
++
++    if (!kvm_vmport_tss_validate_unused_map_area(cs, second.tr.base)) {
 +        return;
 +    }
 +
