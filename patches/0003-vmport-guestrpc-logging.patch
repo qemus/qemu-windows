@@ -156,7 +156,7 @@ diff --git a/hw/i386/vmport.c b/hw/i386/vmport.c
 +static const char *vmport_guestrpc_guestinfo_override(const char *key)
 +{
 +    if (!strcmp(key, "guestinfo.svga.wddm.buildType")) {
-+        return "stats";
++        return "release";
 +    }
 +    if (!strcmp(key, "guestinfo.svga.wddm.miniportLogging")) {
 +        return "TRUE";
