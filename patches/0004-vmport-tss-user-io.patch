@@ -1,7 +1,7 @@
 diff --git a/target/i386/kvm/kvm.c b/target/i386/kvm/kvm.c
 --- a/target/i386/kvm/kvm.c
 +++ b/target/i386/kvm/kvm.c
-@@ -5985,6 +5985,508 @@
+@@ -5985,6 +5985,350 @@
      }
  }
  
@@ -13,24 +13,17 @@ diff --git a/target/i386/kvm/kvm.c b/target/i386/kvm/kvm.c
 +#define KVM_VMPORT_TSS_IOMAP_LIMIT    0x0b34
 +#define KVM_VMPORT_TSS_IOMAP_BYTES    (KVM_VMPORT_TSS_IOMAP_LIMIT - KVM_VMPORT_TSS_IOMAP_BASE + 1)
 +#define KVM_VMPORT_TSS_VMWARE_BYTE    (0x5658 >> 3)
-+#define KVM_VMPORT_TSS_PORT           0x5658
 +#define KVM_VMPORT_TSS_PROBE_US       10000LL
-+#define KVM_VMPORT_TSS_WINDOW_US      5000000LL
 +#define KVM_VMPORT_TSS_DIAG_US        1000000LL
-+#define KVM_VMPORT_TSS_STABLE_SAMPLES 2
 +
 +/*
-+ * 0 = unknown, 1 = disabled for this VM, 2 = eligible, 3 = completed.
-+ * State 1/3 makes the post-run hot path a single cached-state check.
++ * 0 = unresolved, 1 = disabled, 2 = probing, 3 = complete.
 + */
 +static int kvm_vmport_tss_feature_state;
 +static int kvm_vmport_tss_debug;
-+static int64_t kvm_vmport_tss_window_until;
 +static int64_t kvm_vmport_tss_next_probe[256];
 +static int64_t kvm_vmport_tss_next_diag[256];
-+static uint64_t kvm_vmport_tss_candidate_base[256];
-+static uint8_t kvm_vmport_tss_candidate_count[256];
-+static bool kvm_vmport_tss_done[256];
++static int kvm_vmport_tss_done[256];
 +
 +#define KVM_VMPORT_TSS_LOG(...)                                          \
 +    do {                                                                 \
@@ -39,6 +32,7 @@ diff --git a/target/i386/kvm/kvm.c b/target/i386/kvm/kvm.c
 +        }                                                                \
 +    } while (0)
 +
++/* Called with the BQL held. */
 +static bool kvm_vmport_tss_feature_enabled(void)
 +{
 +    int state = qatomic_read(&kvm_vmport_tss_feature_state);
@@ -50,11 +44,6 @@ diff --git a/target/i386/kvm/kvm.c b/target/i386/kvm/kvm.c
 +        return state == 2;
 +    }
 +
-+    /*
-+     * Resolve VMVGA first so every diagnostic, including disabled-state
-+     * messages, follows the device's existing debug property.  The property
-+     * is a realized-device configuration knob and is cached here once.
-+     */
 +    vmvga = object_resolve_path_type("", "vmvga", NULL);
 +    if (!vmvga) {
 +        qatomic_set(&kvm_vmport_tss_feature_state, 1);
@@ -81,23 +70,10 @@ diff --git a/target/i386/kvm/kvm.c b/target/i386/kvm/kvm.c
 +    }
 +
 +    qatomic_set(&kvm_vmport_tss_feature_state, 2);
++    KVM_VMPORT_TSS_LOG(
++        "vmport-tss: armed, vmvga 3d enabled; probing x64 TSS every "
++        "10 ms until all vcpus are configured\n");
 +    return true;
-+}
-+
-+static void kvm_vmport_tss_reset_candidate(unsigned int index)
-+{
-+    if (index < ARRAY_SIZE(kvm_vmport_tss_candidate_count)) {
-+        kvm_vmport_tss_candidate_count[index] = 0;
-+        kvm_vmport_tss_candidate_base[index] = 0;
-+    }
-+}
-+
-+static bool kvm_vmport_tss_is_trigger(const struct kvm_run *run)
-+{
-+    return run->exit_reason == KVM_EXIT_IO &&
-+           run->io.port == KVM_VMPORT_TSS_PORT &&
-+           run->io.direction == KVM_EXIT_IO_IN &&
-+           run->io.size == 4 && run->io.count != 0;
 +}
 +
 +static bool kvm_vmport_tss_all_done(void)
@@ -108,62 +84,11 @@ diff --git a/target/i386/kvm/kvm.c b/target/i386/kvm/kvm.c
 +        unsigned int index = cs->cpu_index;
 +
 +        if (index >= ARRAY_SIZE(kvm_vmport_tss_done) ||
-+            !kvm_vmport_tss_done[index]) {
++            !qatomic_read(&kvm_vmport_tss_done[index])) {
 +            return false;
 +        }
 +    }
 +
-+    return true;
-+}
-+
-+static void kvm_vmport_tss_prepare_window(void)
-+{
-+    unsigned int i;
-+
-+    for (i = 0; i < ARRAY_SIZE(kvm_vmport_tss_candidate_count); i++) {
-+        if (!kvm_vmport_tss_done[i]) {
-+            kvm_vmport_tss_candidate_count[i] = 0;
-+            kvm_vmport_tss_candidate_base[i] = 0;
-+            kvm_vmport_tss_next_probe[i] = 0;
-+            kvm_vmport_tss_next_diag[i] = 0;
-+        }
-+    }
-+}
-+
-+/* Called with the BQL held after an actual KVM I/O exit on port 0x5658. */
-+static bool kvm_vmport_tss_arm_window(X86CPU *cpu,
-+                                      const struct kvm_run *run)
-+{
-+    CPUState *cs = CPU(cpu);
-+    struct kvm_sregs sregs;
-+    int64_t now;
-+    int ret;
-+
-+    if (!kvm_vmport_tss_feature_enabled() || kvm_vmport_tss_all_done()) {
-+        return false;
-+    }
-+
-+    /*
-+     * Before the bitmap is installed, ring-3 access faults before becoming a
-+     * KVM_EXIT_IO.  Check DPL anyway so that, after one vCPU is modified, a
-+     * user-mode vmport access can never re-arm an expired window.
-+     */
-+    ret = kvm_vcpu_ioctl(cs, KVM_GET_SREGS, &sregs);
-+    if (ret < 0 || sregs.cs.dpl != 0) {
-+        return false;
-+    }
-+
-+    now = g_get_monotonic_time();
-+    kvm_vmport_tss_prepare_window();
-+    qatomic_set(&kvm_vmport_tss_window_until,
-+                now + KVM_VMPORT_TSS_WINDOW_US);
-+
-+    KVM_VMPORT_TSS_LOG(
-+            "vmport-tss: activated by vcpu=%d KVM_EXIT_IO port=0x%04x "
-+            "direction=in size=%u count=%u; immediate all-vcpu probe, "
-+            "retries every 10 ms for 5 s\n",
-+            cs->cpu_index, run->io.port, (unsigned int)run->io.size,
-+            (unsigned int)run->io.count);
 +    return true;
 +}
 +
@@ -175,7 +100,8 @@ diff --git a/target/i386/kvm/kvm.c b/target/i386/kvm/kvm.c
 +    int64_t now;
 +    unsigned int lma = !!(sregs->efer & MSR_EFER_LMA);
 +
-+    if (index >= ARRAY_SIZE(kvm_vmport_tss_next_diag)) {
++    if (!qatomic_read(&kvm_vmport_tss_debug) ||
++        index >= ARRAY_SIZE(kvm_vmport_tss_next_diag)) {
 +        return;
 +    }
 +
@@ -241,113 +167,122 @@ diff --git a/target/i386/kvm/kvm.c b/target/i386/kvm/kvm.c
 +    return false;
 +}
 +
++/*
++ * Try to install the bitmap before VMware's user-mode driver can execute the
++ * backdoor IN instruction.  The TSS is sampled twice back-to-back; a valid
++ * sample is never allowed to resume the guest between qualification and the
++ * bitmap installation.
++ *
++ * Called with the BQL held.
++ */
 +static void kvm_vmport_tss_enable_user_io(X86CPU *cpu)
 +{
 +    CPUState *cs = CPU(cpu);
 +    CPUX86State *env = &cpu->env;
 +    unsigned int index = cs->cpu_index;
-+    struct kvm_sregs sregs;
++    struct kvm_sregs first;
++    struct kvm_sregs second;
 +    uint8_t io_map_base[2];
++    uint8_t io_map_base2[2];
 +    uint8_t io_map[KVM_VMPORT_TSS_IOMAP_BYTES];
 +    uint16_t iomap;
-+    uint8_t lma;
++    uint16_t iomap2;
 +    int ret;
 +
-+    if (index >= ARRAY_SIZE(kvm_vmport_tss_candidate_count) ||
-+        kvm_vmport_tss_done[index] ||
-+        !kvm_vmport_tss_feature_enabled()) {
++    if (index >= ARRAY_SIZE(kvm_vmport_tss_done) ||
++        qatomic_read(&kvm_vmport_tss_done[index]) ||
++        qatomic_read(&kvm_vmport_tss_feature_state) != 2) {
 +        return;
 +    }
 +
-+    if (env->tr.limit == KVM_VMPORT_TSS_IOMAP_LIMIT) {
-+        kvm_vmport_tss_done[index] = true;
-+        return;
-+    }
-+
-+    ret = kvm_vcpu_ioctl(cs, KVM_GET_SREGS, &sregs);
++    ret = kvm_vcpu_ioctl(cs, KVM_GET_SREGS, &first);
 +    if (ret < 0) {
-+        kvm_vmport_tss_reset_candidate(index);
 +        return;
 +    }
 +
-+    lma = !!(sregs.efer & MSR_EFER_LMA);
-+    if (!lma || !sregs.tr.present || sregs.tr.type != 11 || !sregs.tr.base ||
-+        sregs.tr.limit != KVM_VMPORT_TSS_ORIGINAL_LIMIT) {
-+        kvm_vmport_tss_reset_candidate(index);
-+        kvm_vmport_tss_diag(cs, &sregs, -1, "waiting-for-win7-shape");
++    if (!(first.efer & MSR_EFER_LMA) || !first.tr.present ||
++        first.tr.type != 11 || !first.tr.base ||
++        first.tr.limit != KVM_VMPORT_TSS_ORIGINAL_LIMIT) {
++        kvm_vmport_tss_diag(cs, &first, -1, "waiting-for-win7-shape");
 +        return;
 +    }
 +
++    /*
++     * Synchronizing here gives cpu_memory_rw_debug() the current CR3 and also
++     * makes the QEMU register image authoritative.  Explicitly setting
++     * vcpu_dirty again after changing TR.limit below documents the required
++     * push before the next KVM_RUN.
++     */
 +    kvm_cpu_synchronize_state(cs);
-+    if (env->tr.base != sregs.tr.base ||
++    if (env->tr.base != first.tr.base ||
 +        env->tr.limit != KVM_VMPORT_TSS_ORIGINAL_LIMIT) {
-+        kvm_vmport_tss_reset_candidate(index);
-+        kvm_vmport_tss_diag(cs, &sregs, -1, "qemu-state-mismatch");
++        kvm_vmport_tss_diag(cs, &first, -1, "qemu-state-mismatch");
 +        return;
 +    }
 +
-+    ret = cpu_memory_rw_debug(cs, env->tr.base + 0x66, io_map_base,
++    ret = cpu_memory_rw_debug(cs, first.tr.base + 0x66, io_map_base,
 +                              sizeof(io_map_base), false);
 +    if (ret != 0) {
-+        kvm_vmport_tss_reset_candidate(index);
-+        kvm_vmport_tss_diag(cs, &sregs, -1, "iomap-read-failed");
++        kvm_vmport_tss_diag(cs, &first, -1, "iomap-read-failed");
 +        return;
 +    }
-+
 +    iomap = io_map_base[0] | ((uint16_t)io_map_base[1] << 8);
 +    if (iomap != KVM_VMPORT_TSS_IOMAP_BASE) {
-+        kvm_vmport_tss_reset_candidate(index);
-+        kvm_vmport_tss_diag(cs, &sregs, iomap, "unexpected-iomap-base");
++        kvm_vmport_tss_diag(cs, &first, iomap, "unexpected-iomap-base");
 +        return;
 +    }
 +
-+    if (kvm_vmport_tss_candidate_count[index] == 0 ||
-+        kvm_vmport_tss_candidate_base[index] != sregs.tr.base) {
-+        kvm_vmport_tss_candidate_base[index] = sregs.tr.base;
-+        kvm_vmport_tss_candidate_count[index] = 1;
-+        KVM_VMPORT_TSS_LOG(
-+                "vmport-tss: vcpu=%d candidate x64 TSS base=0x%" PRIx64
-+                " limit=0x%x iomap=0x%04x sample=1/%d\n",
-+                cs->cpu_index, (uint64_t)sregs.tr.base, sregs.tr.limit,
-+                iomap, KVM_VMPORT_TSS_STABLE_SAMPLES);
++    /* Immediate second sample: do not resume guest execution in between. */
++    ret = kvm_vcpu_ioctl(cs, KVM_GET_SREGS, &second);
++    if (ret < 0 || !(second.efer & MSR_EFER_LMA) ||
++        !second.tr.present || second.tr.type != 11 ||
++        second.tr.base != first.tr.base ||
++        second.tr.limit != KVM_VMPORT_TSS_ORIGINAL_LIMIT) {
++        kvm_vmport_tss_diag(cs, &second, -1, "unstable-second-sample");
 +        return;
 +    }
 +
-+    if (++kvm_vmport_tss_candidate_count[index] <
-+        KVM_VMPORT_TSS_STABLE_SAMPLES) {
++    ret = cpu_memory_rw_debug(cs, second.tr.base + 0x66, io_map_base2,
++                              sizeof(io_map_base2), false);
++    if (ret != 0) {
++        kvm_vmport_tss_diag(cs, &second, -1, "second-iomap-read-failed");
++        return;
++    }
++    iomap2 = io_map_base2[0] | ((uint16_t)io_map_base2[1] << 8);
++    if (iomap2 != iomap) {
++        kvm_vmport_tss_diag(cs, &second, iomap2, "unstable-iomap-base");
 +        return;
 +    }
 +
 +    KVM_VMPORT_TSS_LOG(
 +            "vmport-tss: vcpu=%d qualified stable x64 TSS base=0x%" PRIx64
 +            " limit=0x%x iomap=0x%04x installing\n",
-+            cs->cpu_index, (uint64_t)env->tr.base, env->tr.limit, iomap);
++            cs->cpu_index, (uint64_t)second.tr.base,
++            second.tr.limit, iomap2);
 +
 +    memset(io_map, 0xff, sizeof(io_map));
 +    io_map[KVM_VMPORT_TSS_VMWARE_BYTE] = 0xf0;
 +
 +    ret = cpu_memory_rw_debug(cs,
-+                              env->tr.base + KVM_VMPORT_TSS_IOMAP_BASE,
++                              second.tr.base + KVM_VMPORT_TSS_IOMAP_BASE,
 +                              io_map, sizeof(io_map), true);
 +    if (ret != 0) {
 +        KVM_VMPORT_TSS_LOG(
 +                "vmport-tss: vcpu=%d reject=IOMAP_WRITE ret=%d "
 +                "address=0x%" PRIx64 " size=0x%zx\n",
 +                cs->cpu_index, ret,
-+                (uint64_t)env->tr.base + KVM_VMPORT_TSS_IOMAP_BASE,
++                (uint64_t)second.tr.base + KVM_VMPORT_TSS_IOMAP_BASE,
 +                sizeof(io_map));
-+        kvm_vmport_tss_reset_candidate(index);
 +        return;
 +    }
 +
-+    if (!kvm_vmport_tss_verify_map(cs, env->tr.base, io_map)) {
-+        kvm_vmport_tss_reset_candidate(index);
++    if (!kvm_vmport_tss_verify_map(cs, second.tr.base, io_map)) {
 +        return;
 +    }
 +
 +    env->tr.limit = KVM_VMPORT_TSS_IOMAP_LIMIT;
-+    kvm_vmport_tss_reset_candidate(index);
-+    kvm_vmport_tss_done[index] = true;
++    cs->vcpu_dirty = true;
++    qatomic_set(&kvm_vmport_tss_done[index], 1);
 +
 +    KVM_VMPORT_TSS_LOG(
 +            "vmport-tss: vcpu=%d enabled user I/O 0x5658-0x565b "
@@ -357,168 +292,59 @@ diff --git a/target/i386/kvm/kvm.c b/target/i386/kvm/kvm.c
 +
 +    if (kvm_vmport_tss_all_done()) {
 +        qatomic_set(&kvm_vmport_tss_feature_state, 3);
-+        qatomic_set(&kvm_vmport_tss_window_until, 0);
 +        KVM_VMPORT_TSS_LOG(
-+                "vmport-tss: all vcpus configured; probe window closed\n");
-+    }
-+}
++                "vmport-tss: all vcpus configured; probing stopped\n");
++    } else {
++        CPUState *other;
 +
-+/*
-+ * A valid TSS is sampled twice back-to-back before it is modified.  This is
-+ * deliberately done in the same post-run path: once VMware has started
-+ * using vmport, resuming a vCPU after sample 1 would leave a window in which
-+ * ring-3 could execute IN 0x5658 and take #GP.
-+ */
-+static void kvm_vmport_tss_probe_immediate(X86CPU *cpu)
-+{
-+    CPUState *cs = CPU(cpu);
-+    unsigned int index = cs->cpu_index;
++        /* Give other currently-running vCPUs an immediate chance to qualify. */
++        CPU_FOREACH(other) {
++            unsigned int other_index = other->cpu_index;
 +
-+    if (index >= ARRAY_SIZE(kvm_vmport_tss_candidate_count) ||
-+        kvm_vmport_tss_done[index]) {
-+        return;
-+    }
-+
-+    kvm_vmport_tss_enable_user_io(cpu);
-+    if (!kvm_vmport_tss_done[index] &&
-+        kvm_vmport_tss_candidate_count[index] != 0) {
-+        kvm_vmport_tss_enable_user_io(cpu);
-+    }
-+
-+    if (!kvm_vmport_tss_done[index]) {
-+        kvm_vmport_tss_next_probe[index] =
-+            g_get_monotonic_time() + KVM_VMPORT_TSS_PROBE_US;
-+    }
-+}
-+
-+/*
-+ * Force every unfinished vCPU out of KVM_RUN as soon as the first kernel
-+ * vmport access is observed.  kvm_arch_post_run() runs even when KVM_RUN was
-+ * interrupted by the kick, so each vCPU gets its immediate TSS attempt before
-+ * that vCPU can resume guest execution.
-+ */
-+static void kvm_vmport_tss_kick_other_vcpus(CPUState *self)
-+{
-+    CPUState *other;
-+
-+    CPU_FOREACH(other) {
-+        unsigned int index = other->cpu_index;
-+
-+        if (other == self ||
-+            (index < ARRAY_SIZE(kvm_vmport_tss_done) &&
-+             kvm_vmport_tss_done[index])) {
-+            continue;
++            if (other != cs &&
++                other_index < ARRAY_SIZE(kvm_vmport_tss_done) &&
++                !qatomic_read(&kvm_vmport_tss_done[other_index])) {
++                qemu_cpu_kick(other);
++            }
 +        }
-+        qemu_cpu_kick(other);
 +    }
 +}
 +
-+static void kvm_vmport_tss_handle_trigger(X86CPU *cpu,
-+                                           const struct kvm_run *run)
-+{
-+    CPUState *cs = CPU(cpu);
-+    unsigned int index = cs->cpu_index;
-+    int64_t until;
-+    int64_t now;
-+
-+    bql_lock();
-+    until = qatomic_read(&kvm_vmport_tss_window_until);
-+    now = g_get_monotonic_time();
-+
-+    if (until == 0 || now >= until) {
-+        if (until != 0) {
-+            qatomic_set(&kvm_vmport_tss_window_until, 0);
-+        }
-+        if (!kvm_vmport_tss_arm_window(cpu, run)) {
-+            bql_unlock();
-+            return;
-+        }
-+
-+        /*
-+         * Set the global window before the kicks.  A kicked vCPU will then
-+         * see an active window in its post-run path and probe immediately.
-+         */
-+        kvm_vmport_tss_kick_other_vcpus(cs);
-+    }
-+
-+    /* The triggering vCPU must not wait for the 10 ms retry cadence. */
-+    if (index < ARRAY_SIZE(kvm_vmport_tss_done) &&
-+        !kvm_vmport_tss_done[index]) {
-+        kvm_vmport_tss_probe_immediate(cpu);
-+    }
-+    bql_unlock();
-+}
-+
-+static void kvm_vmport_tss_post_run(X86CPU *cpu, struct kvm_run *run)
++static void kvm_vmport_tss_post_run(X86CPU *cpu)
 +{
 +    CPUState *cs = CPU(cpu);
 +    unsigned int index = cs->cpu_index;
 +    int state = qatomic_read(&kvm_vmport_tss_feature_state);
-+    int64_t until;
 +    int64_t now;
-+    bool trigger;
 +
 +    if (state == 1 || state == 3 ||
 +        index >= ARRAY_SIZE(kvm_vmport_tss_next_probe)) {
 +        return;
 +    }
 +
-+    until = qatomic_read(&kvm_vmport_tss_window_until);
-+    trigger = kvm_vmport_tss_is_trigger(run);
-+
-+    /*
-+     * Dormant is the normal steady state.  Only an actual 0x5658 IN exit can
-+     * open a probe window, and arm_window() additionally requires CPL0.
-+     */
-+    if (until == 0) {
-+        if (trigger) {
-+            kvm_vmport_tss_handle_trigger(cpu, run);
++    if (state == 0) {
++        bql_lock();
++        if (!kvm_vmport_tss_feature_enabled()) {
++            bql_unlock();
++            return;
 +        }
++        bql_unlock();
++    }
++
++    if (qatomic_read(&kvm_vmport_tss_done[index])) {
 +        return;
 +    }
 +
 +    now = g_get_monotonic_time();
-+    if (now >= until) {
-+        /*
-+         * A trigger at the expiry boundary gets first chance to re-arm; its
-+         * CPL is checked by arm_window().  Otherwise close the window.
-+         */
-+        if (trigger) {
-+            kvm_vmport_tss_handle_trigger(cpu, run);
-+            return;
-+        }
-+        if (qatomic_cmpxchg(&kvm_vmport_tss_window_until, until, 0) == until) {
-+            KVM_VMPORT_TSS_LOG(
-+                    "vmport-tss: 5 s probe window expired; dormant until "
-+                    "the next kernel 0x5658 I/O exit\n");
-+        }
-+        return;
-+    }
-+
-+    if (kvm_vmport_tss_done[index]) {
-+        return;
-+    }
-+
-+    /* A real kernel vmport exit always bypasses the retry throttle. */
-+    if (trigger) {
-+        kvm_vmport_tss_handle_trigger(cpu, run);
-+        return;
-+    }
-+
 +    if (now < kvm_vmport_tss_next_probe[index]) {
 +        return;
 +    }
++    kvm_vmport_tss_next_probe[index] = now + KVM_VMPORT_TSS_PROBE_US;
 +
 +    bql_lock();
-+    until = qatomic_read(&kvm_vmport_tss_window_until);
-+    now = g_get_monotonic_time();
-+    if (until != 0 && now < until && !kvm_vmport_tss_done[index]) {
-+        /*
-+         * This is either the immediate exit caused by the all-vCPU kick or a
-+         * later 10 ms retry.  If the TSS is valid, both stability samples and
-+         * the bitmap installation happen before this vCPU resumes the guest.
-+         */
-+        kvm_vmport_tss_probe_immediate(cpu);
++    if (qatomic_read(&kvm_vmport_tss_feature_state) == 2 &&
++        !qatomic_read(&kvm_vmport_tss_done[index])) {
++        kvm_vmport_tss_enable_user_io(cpu);
 +    }
 +    bql_unlock();
 +}
@@ -530,7 +356,7 @@ diff --git a/target/i386/kvm/kvm.c b/target/i386/kvm/kvm.c
      X86CPU *x86_cpu = X86_CPU(cpu);
      CPUX86State *env = &x86_cpu->env;
  
-+    kvm_vmport_tss_post_run(x86_cpu, run);
++    kvm_vmport_tss_post_run(x86_cpu);
 +
      if (run->flags & KVM_RUN_X86_SMM) {
          env->hflags |= HF_SMM_MASK;
