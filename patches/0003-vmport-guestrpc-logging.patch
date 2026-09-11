@@ -124,14 +124,11 @@ diff --git a/hw/i386/vmport.c b/hw/i386/vmport.c
 +
 +static void vmport_guestrpc_print_rpc(const uint8_t *message, size_t size)
 +{
-+    GString *line;
++    GString *line = vmport_guestrpc_format_line("vmport-rpc: ",
++                                                 message, size);
 +
-+    if (!qemu_loglevel_mask(LOG_UNIMP)) {
-+        return;
-+    }
-+
-+    line = vmport_guestrpc_format_line("vmport-rpc: ", message, size);
-+    qemu_log_mask(LOG_UNIMP, "%s\n", line->str);
++    fprintf(stderr, "%s\n", line->str);
++    fflush(stderr);
 +    g_string_free(line, true);
 +}
 +
@@ -144,6 +141,8 @@ diff --git a/hw/i386/vmport.c b/hw/i386/vmport.c
 +    static const char miniport_loglevel_reply[] = "1 9";
 +    static const char vsync_reply[] = "1 FALSE";
 +    static const char unknown_reply[] = "0 Unknown command";
++
++    vmport_guestrpc_print_rpc(channel->request, channel->request_size);
 +
 +    if (channel->request_size ==
 +            sizeof("info-get guestinfo.svga.wddm.buildType") - 1 &&
@@ -187,7 +186,6 @@ diff --git a/hw/i386/vmport.c b/hw/i386/vmport.c
 +        channel->reply = success_reply;
 +        channel->reply_size = sizeof(success_reply) - 1;
 +    } else {
-+        vmport_guestrpc_print_rpc(channel->request, channel->request_size);
 +        channel->reply = unknown_reply;
 +        channel->reply_size = sizeof(unknown_reply) - 1;
 +    }
