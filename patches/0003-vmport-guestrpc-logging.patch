@@ -159,18 +159,7 @@ index 6f40eff..b46466e 100644
 +    if (!strcmp(key, "guestinfo.svga.wddm.buildType")) {
 +        return "release";
 +    }
-+    if (!strcmp(key, "guestinfo.svga.wddm.miniportLogging")) {
-+        return "TRUE";
-+    }
-+    if (!strcmp(key, "guestinfo.loglevel.vm3d.miniport")) {
-+        return "9";
-+    }
-+    if (!strcmp(key, "guestinfo.loglevel.vm3d.present")) {
-+        return "9";
-+    }
-+    if (!strcmp(key, "guestinfo.loglevel.vm3d.vidpn")) {
-+        return "10";
-+    }
++
 +    return NULL;
 +}
 +
