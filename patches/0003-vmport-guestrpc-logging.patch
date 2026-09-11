@@ -1,5 +1,4 @@
 diff --git a/hw/i386/vmport.c b/hw/i386/vmport.c
-index 865e0e70db6e6bcf6d98112e3f185154da1d7083..37a6866c150fbd40b13339eae7b151a143452131 100644
 --- a/hw/i386/vmport.c
 +++ b/hw/i386/vmport.c
 @@ -42,6 +42,36 @@
@@ -139,10 +138,50 @@ index 865e0e70db6e6bcf6d98112e3f185154da1d7083..37a6866c150fbd40b13339eae7b151a1
 +static void vmport_guestrpc_finish_request(VMPortGuestRPCChannel *channel)
 +{
 +    static const char success_reply[] = "1 ";
++    static const char build_type_reply[] = "1 debug";
++    static const char miniport_logging_reply[] = "1 TRUE";
++    static const char present_loglevel_reply[] = "1 9";
++    static const char miniport_loglevel_reply[] = "1 9";
++    static const char vsync_reply[] = "1 FALSE";
 +    static const char unknown_reply[] = "0 Unknown command";
 +
-+    if (channel->request_size >= 4 &&
-+        !memcmp(channel->request, "log ", 4)) {
++    if (channel->request_size ==
++            sizeof("info-get guestinfo.svga.wddm.buildType") - 1 &&
++        !memcmp(channel->request,
++                "info-get guestinfo.svga.wddm.buildType",
++                sizeof("info-get guestinfo.svga.wddm.buildType") - 1)) {
++        channel->reply = build_type_reply;
++        channel->reply_size = sizeof(build_type_reply) - 1;
++    } else if (channel->request_size ==
++                   sizeof("info-get guestinfo.svga.wddm.miniportLogging") - 1 &&
++               !memcmp(channel->request,
++                       "info-get guestinfo.svga.wddm.miniportLogging",
++                       sizeof("info-get guestinfo.svga.wddm.miniportLogging") - 1)) {
++        channel->reply = miniport_logging_reply;
++        channel->reply_size = sizeof(miniport_logging_reply) - 1;
++    } else if (channel->request_size ==
++                   sizeof("info-get guestinfo.loglevel.vm3d.present") - 1 &&
++               !memcmp(channel->request,
++                       "info-get guestinfo.loglevel.vm3d.present",
++                       sizeof("info-get guestinfo.loglevel.vm3d.present") - 1)) {
++        channel->reply = present_loglevel_reply;
++        channel->reply_size = sizeof(present_loglevel_reply) - 1;
++    } else if (channel->request_size ==
++                   sizeof("info-get guestinfo.loglevel.vm3d.miniport") - 1 &&
++               !memcmp(channel->request,
++                       "info-get guestinfo.loglevel.vm3d.miniport",
++                       sizeof("info-get guestinfo.loglevel.vm3d.miniport") - 1)) {
++        channel->reply = miniport_loglevel_reply;
++        channel->reply_size = sizeof(miniport_loglevel_reply) - 1;
++    } else if (channel->request_size ==
++                   sizeof("info-get guestinfo.svga.wddm.enableVSync") - 1 &&
++               !memcmp(channel->request,
++                       "info-get guestinfo.svga.wddm.enableVSync",
++                       sizeof("info-get guestinfo.svga.wddm.enableVSync") - 1)) {
++        channel->reply = vsync_reply;
++        channel->reply_size = sizeof(vsync_reply) - 1;
++    } else if (channel->request_size >= 4 &&
++               !memcmp(channel->request, "log ", 4)) {
 +        vmport_guestrpc_print_log(channel->request + 4,
 +                                  channel->request_size - 4);
 +        channel->reply = success_reply;
@@ -310,7 +349,6 @@ index 865e0e70db6e6bcf6d98112e3f185154da1d7083..37a6866c150fbd40b13339eae7b151a1
          vmport_register(VMPORT_CMD_GETBIOSUUID, vmport_cmd_get_bios_uuid, NULL);
          vmport_register(VMPORT_CMD_GETHZ, vmport_cmd_get_hz, NULL);
 diff --git a/include/hw/i386/vmport.h b/include/hw/i386/vmport.h
-index 8f5e27c6f5956ab82df147328c8b278ef7e8e797..c989346f066ce7c6410e093f65377350a5eba6b4 100644
 --- a/include/hw/i386/vmport.h
 +++ b/include/hw/i386/vmport.h
 @@ -10,6 +10,7 @@ typedef enum {
