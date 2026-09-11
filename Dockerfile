@@ -263,8 +263,8 @@ RUN <<'EOF_BUILD'
     }
   done
 
-  strings /out/qemu-system-x86_64 | grep -Fq 'vmport-tss: armed, probing every KVM exit for x64 TSS' || {
-    echo "FAIL: stable x64 vmport TSS compatibility code was not compiled in."
+  strings /out/qemu-system-x86_64 | grep -Fq 'probing x64 TSS every 10 ms for 5 s' || {
+    echo "FAIL: gated/event-triggered x64 vmport TSS compatibility code was not compiled in."
     exit 1
   }
 
