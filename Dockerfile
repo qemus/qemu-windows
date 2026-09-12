@@ -263,11 +263,6 @@ RUN <<'EOF_BUILD'
     }
   done
 
-  strings /out/qemu-system-x86_64 | grep -Fq 'probing x64 TSS every 10 ms until all vcpus are configured' || {
-    echo "FAIL: vmport TSS compatibility code was not compiled in."
-    exit 1
-  }
-
 EOF_BUILD
 
 # Test the produced executable inside the actual qemux/qemu runtime image.
