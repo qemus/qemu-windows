@@ -197,7 +197,7 @@ index 6f40eff..b46466e 100644
 +    }
 +
 +    if (!strcmp(key, "guestinfo.svga.wddm.gbPrimaryInApt")) {
-+        return "0";
++        return "FALSE";
 +    }
 +
 +    return NULL;
