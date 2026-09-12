@@ -69,7 +69,7 @@
 +        return false;
 +    }
 +
-+    enable_3d = object_property_get_bool(vmvga, "3d", NULL);
++    enable_3d = false; /* Temporary: disable vmport TSS user-I/O setup */
 +    if (!enable_3d) {
 +        qatomic_set(&kvm_vmport_tss_feature_state, 1);
 +        KVM_VMPORT_TSS_LOG(
