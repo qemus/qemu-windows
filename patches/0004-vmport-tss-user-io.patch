@@ -1,6 +1,6 @@
 --- a/target/i386/kvm/kvm.c
 +++ b/target/i386/kvm/kvm.c
-@@ -5985,6 +5985,710 @@
+@@ -5985,6 +5985,748 @@
      }
  }
  
@@ -30,6 +30,7 @@
 +typedef struct KVMVMPortTSSVCPUState {
 +    int64_t next_probe;
 +    int64_t next_diag;
++    uint64_t last_candidate_base;
 +    uint64_t rejected_tss_base;
 +    int rejected_tss_valid;
 +    int seen_lma;
@@ -430,7 +431,8 @@
 + * the BQL so a setup-time TSS that already failed full validation does not
 + * repeatedly serialize the VM through the expensive guest-memory checks.
 + */
-+static bool kvm_vmport_tss_candidate_ready(X86CPU *cpu)
++static bool kvm_vmport_tss_candidate_ready(X86CPU *cpu,
++                                            uint64_t *candidate_base)
 +{
 +    CPUState *cs = CPU(cpu);
 +    unsigned int index = cs->cpu_index;
@@ -466,22 +468,50 @@
 +        return false;
 +    }
 +
-+    if (!qatomic_read(&state->rejected_tss_valid)) {
-+        return true;
++    if (qatomic_read(&state->rejected_tss_valid)) {
++        rejected_base = state->rejected_tss_base;
++        if (sregs.tr.base == rejected_base) {
++            return false;
++        }
++    } else {
++        rejected_base = 0;
 +    }
 +
-+    rejected_base = state->rejected_tss_base;
-+    if (sregs.tr.base == rejected_base) {
-+        return false;
++    if (state->last_candidate_base != sregs.tr.base) {
++        if (rejected_base) {
++            KVM_VMPORT_TSS_LOG(
++                    "vmport-tss: vcpu=%d new candidate tss=0x%" PRIx64
++                    " previous-rejected=0x%" PRIx64 "\n",
++                    cs->cpu_index, (uint64_t)sregs.tr.base, rejected_base);
++        } else {
++            KVM_VMPORT_TSS_LOG(
++                    "vmport-tss: vcpu=%d candidate tss=0x%" PRIx64 "\n",
++                    cs->cpu_index, (uint64_t)sregs.tr.base);
++        }
++        state->last_candidate_base = sregs.tr.base;
 +    }
 +
-+    KVM_VMPORT_TSS_LOG(
-+            "vmport-tss: vcpu=%d new candidate tss=0x%" PRIx64
-+            " previous-rejected=0x%" PRIx64 "\n",
-+            cs->cpu_index, (uint64_t)sregs.tr.base, rejected_base);
-+    state->rejected_tss_base = 0;
-+    qatomic_set(&state->rejected_tss_valid, 0);
++    *candidate_base = sregs.tr.base;
 +    return true;
++}
++
++static void kvm_vmport_tss_reject_candidate(CPUState *cs, uint64_t base,
++                                             const char *reason)
++{
++    unsigned int index = cs->cpu_index;
++    KVMVMPortTSSVCPUState *state;
++
++    if (index >= ARRAY_SIZE(kvm_vmport_tss_vcpu)) {
++        return;
++    }
++
++    state = &kvm_vmport_tss_vcpu[index];
++    state->rejected_tss_base = base;
++    qatomic_set(&state->rejected_tss_valid, 1);
++    KVM_VMPORT_TSS_LOG(
++            "vmport-tss: vcpu=%d rejected candidate tss=0x%" PRIx64
++            " reason=%s; suppressing repeated expensive validation\n",
++            cs->cpu_index, base, reason);
 +}
 +
 +/*
@@ -492,7 +522,8 @@
 + *
 + * Called with the BQL held.
 + */
-+static void kvm_vmport_tss_enable_user_io(X86CPU *cpu)
++static void kvm_vmport_tss_enable_user_io(X86CPU *cpu,
++                                            uint64_t candidate_base)
 +{
 +    CPUState *cs = CPU(cpu);
 +    CPUX86State *env = &cpu->env;
@@ -526,8 +557,10 @@
 +
 +    if (!(first.efer & MSR_EFER_LMA) || !first.tr.present ||
 +        first.tr.type != 11 || !first.tr.base ||
-+        first.tr.limit != KVM_VMPORT_TSS_ORIGINAL_LIMIT) {
-+        kvm_vmport_tss_diag(cs, &first, -1, "waiting-for-windows-x64-tss");
++        first.tr.limit != KVM_VMPORT_TSS_ORIGINAL_LIMIT ||
++        first.tr.base != candidate_base) {
++        kvm_vmport_tss_diag(cs, &first, -1,
++                            "candidate-changed-before-validation");
 +        return;
 +    }
 +
@@ -553,14 +586,22 @@
 +    iomap = io_map_base[0] | ((uint16_t)io_map_base[1] << 8);
 +    if (iomap != KVM_VMPORT_TSS_LEGACY_IOMAP_BASE) {
 +        kvm_vmport_tss_diag(cs, &first, iomap, "unexpected-iomap-base");
++        kvm_vmport_tss_reject_candidate(cs, first.tr.base,
++                                        "unexpected-iomap-base");
 +        return;
 +    }
 +
 +    /* Immediate second sample: do not resume guest execution in between. */
 +    ret = kvm_vcpu_ioctl(cs, KVM_GET_SREGS, &second);
-+    if (ret < 0 || !(second.efer & MSR_EFER_LMA) ||
-+        !second.tr.present || second.tr.type != 11 ||
-+        second.tr.base != first.tr.base ||
++    if (ret < 0) {
++        KVM_VMPORT_TSS_LOG(
++                "vmport-tss: vcpu=%d reject=SECOND_SREGS_READ ret=%d "
++                "tss=0x%" PRIx64 "\n",
++                cs->cpu_index, ret, (uint64_t)first.tr.base);
++        return;
++    }
++    if (!(second.efer & MSR_EFER_LMA) || !second.tr.present ||
++        second.tr.type != 11 || second.tr.base != first.tr.base ||
 +        second.tr.limit != KVM_VMPORT_TSS_ORIGINAL_LIMIT) {
 +        kvm_vmport_tss_diag(cs, &second, -1, "unstable-second-sample");
 +        return;
@@ -581,12 +622,8 @@
 +    if (!kvm_vmport_tss_select_layout(cs, second.tr.base,
 +                                      &selected_iomap, &selected_limit,
 +                                      &layout)) {
-+        kvm_vmport_tss_vcpu[index].rejected_tss_base = second.tr.base;
-+        qatomic_set(&kvm_vmport_tss_vcpu[index].rejected_tss_valid, 1);
-+        KVM_VMPORT_TSS_LOG(
-+                "vmport-tss: vcpu=%d rejected candidate tss=0x%" PRIx64
-+                "; suppressing repeated expensive validation\n",
-+                cs->cpu_index, (uint64_t)second.tr.base);
++        kvm_vmport_tss_reject_candidate(cs, second.tr.base,
++                                        "layout-validation");
 +        return;
 +    }
 +
@@ -664,6 +701,7 @@
 +    CPUState *cs = CPU(cpu);
 +    unsigned int index = cs->cpu_index;
 +    KVMVMPortTSSVCPUState *vcpu_state;
++    uint64_t candidate_base;
 +    int state = qatomic_read(&kvm_vmport_tss_feature_state);
 +    int64_t now;
 +
@@ -695,11 +733,11 @@
 +     * Keep the 10 ms long-mode cadence, but reject known-bad setup TSS bases
 +     * before taking the BQL.  A changed TR base is eligible immediately.
 +     */
-+    if (kvm_vmport_tss_candidate_ready(cpu)) {
++    if (kvm_vmport_tss_candidate_ready(cpu, &candidate_base)) {
 +        bql_lock();
 +        if (qatomic_read(&kvm_vmport_tss_feature_state) == 2 &&
 +            !qatomic_read(&vcpu_state->done)) {
-+            kvm_vmport_tss_enable_user_io(cpu);
++            kvm_vmport_tss_enable_user_io(cpu, candidate_base);
 +        }
 +        bql_unlock();
 +    }
