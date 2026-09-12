@@ -163,9 +163,9 @@
 + * KVA-shadowed x64 Windows uses a KPROCESSOR_DESCRIPTOR_AREA layout with
 + * TssSpare (+0x68), KernelGsBase (+0x70), IdleStack (+0x78), and then the
 + * explicitly reserved TssPad beginning at +0x80.  Do not depend on the TSS
-+ * virtual address being page-aligned: that is not a stable layout property
-+ * across Windows builds.  Identify the layout from the post-TSS fields instead
-+ * before ever treating TssPad as bitmap storage.
++ * virtual address alone.  Require page alignment together with stable post-TSS
++ * fields before ever treating TssPad as bitmap storage.  IdleStack may be NULL
++ * on Windows builds that do not populate that optional pointer.
 + */
 +static bool kvm_vmport_tss_is_processor_descriptor_area(CPUState *cs,
 +                                                         uint64_t base)
@@ -196,9 +196,9 @@
 +        first + KVM_VMPORT_TSS_PDA_IDLE_STACK -
 +        KVM_VMPORT_TSS_PDA_TSS_SPARE);
 +
-+    if (tss_spare != 0 ||
++    if ((base & 0xfff) != 0 || tss_spare != 0 ||
 +        !kvm_vmport_tss_is_kernel_pointer(kernel_gs_base) ||
-+        !kvm_vmport_tss_is_kernel_pointer(idle_stack)) {
++        (idle_stack != 0 && !kvm_vmport_tss_is_kernel_pointer(idle_stack))) {
 +        if (kvm_vmport_tss_diag_due(cs)) {
 +            fprintf(stderr,
 +                    "vmport-tss: vcpu=%d pda-fingerprint-miss "
