@@ -51,7 +51,7 @@ index 6f40eff..b46466e 100644
  };
  
  static VMPortState *port_state;
-@@ -154,6 +189,368 @@ static VMPortState *port_state;
+@@ -154,6 +189,372 @@ static VMPortState *port_state;
      cpu->env.regs[R_EAX] = vmport_ioport_read(opaque, addr, 4);
  }
  
@@ -194,6 +194,10 @@ index 6f40eff..b46466e 100644
 +{
 +    if (!strcmp(key, "guestinfo.svga.wddm.buildType")) {
 +        return "release";
++    }
++
++    if (!strcmp(key, "guestinfo.svga.wddm.gbPrimaryInApt")) {
++        return "0";
 +    }
 +
 +    return NULL;
@@ -420,7 +424,7 @@ index 6f40eff..b46466e 100644
  static uint32_t vmport_cmd_get_version(void *opaque, uint32_t addr)
  {
      X86CPU *cpu = X86_CPU(current_cpu);
-@@ -244,6 +641,7 @@ static uint32_t vmport_cmd_get_version(void *opaque, uint32_t addr)
+@@ -244,6 +645,7 @@ static uint32_t vmport_cmd_get_version(void *opaque, uint32_t addr)
      /* Register some generic port commands */
      vmport_register(VMPORT_CMD_GETVERSION, vmport_cmd_get_version, NULL);
      vmport_register(VMPORT_CMD_GETRAMSIZE, vmport_cmd_ram_size, NULL);
