@@ -1,11 +1,12 @@
 --- a/target/i386/kvm/kvm.c
 +++ b/target/i386/kvm/kvm.c
-@@ -5985,6 +5985,599 @@
+@@ -5985,6 +5985,710 @@
      }
  }
  
 +#include "qom/object.h"
 +#include "hw/core/cpu.h"
++#include "system/reset.h"
 +
 +#define KVM_VMPORT_TSS_ORIGINAL_LIMIT       0x0067
 +#define KVM_VMPORT_TSS_LEGACY_IOMAP_BASE    0x0068
@@ -26,12 +27,19 @@
 +/*
 + * 0 = unresolved, 1 = disabled, 2 = probing, 3 = complete.
 + */
++typedef struct KVMVMPortTSSVCPUState {
++    int64_t next_probe;
++    int64_t next_diag;
++    uint64_t rejected_tss_base;
++    int rejected_tss_valid;
++    int seen_lma;
++    int done;
++} KVMVMPortTSSVCPUState;
++
 +static int kvm_vmport_tss_feature_state;
 +static int kvm_vmport_tss_debug;
-+static int64_t kvm_vmport_tss_next_probe[256];
-+static int64_t kvm_vmport_tss_next_diag[256];
-+static int kvm_vmport_tss_seen_lma[256];
-+static int kvm_vmport_tss_done[256];
++static KVMVMPortTSSVCPUState kvm_vmport_tss_vcpu[256];
++static bool kvm_vmport_tss_reset_registered;
 +
 +#define KVM_VMPORT_TSS_LOG(...)                                          \
 +    do {                                                                 \
@@ -39,6 +47,29 @@
 +            fprintf(stderr, __VA_ARGS__);                                \
 +        }                                                                \
 +    } while (0)
++
++static void kvm_vmport_tss_reset_bookkeeping(void)
++{
++    memset(kvm_vmport_tss_vcpu, 0, sizeof(kvm_vmport_tss_vcpu));
++}
++
++static void kvm_vmport_tss_reset(void *opaque)
++{
++    int state = qatomic_read(&kvm_vmport_tss_feature_state);
++
++    kvm_vmport_tss_reset_bookkeeping();
++
++    if (state == 3) {
++        qatomic_set(&kvm_vmport_tss_feature_state, 2);
++        KVM_VMPORT_TSS_LOG(
++            "vmport-tss: system reset; bookkeeping cleared and probing "
++            "re-armed\n");
++    } else if (state == 2) {
++        KVM_VMPORT_TSS_LOG(
++            "vmport-tss: system reset; bookkeeping cleared; probing "
++            "remains armed\n");
++    }
++}
 +
 +/* Called with the BQL held. */
 +static bool kvm_vmport_tss_feature_enabled(void)
@@ -77,6 +108,12 @@
 +        return false;
 +    }
 +
++    if (!kvm_vmport_tss_reset_registered) {
++        qemu_register_reset_nosnapshotload(kvm_vmport_tss_reset, NULL);
++        kvm_vmport_tss_reset_registered = true;
++    }
++
++    kvm_vmport_tss_reset_bookkeeping();
 +    qatomic_set(&kvm_vmport_tss_feature_state, 2);
 +    KVM_VMPORT_TSS_LOG(
 +        "vmport-tss: armed, vmvga 3d enabled; pre-long-mode probes every "
@@ -91,8 +128,8 @@
 +    CPU_FOREACH(cs) {
 +        unsigned int index = cs->cpu_index;
 +
-+        if (index >= ARRAY_SIZE(kvm_vmport_tss_done) ||
-+            !qatomic_read(&kvm_vmport_tss_done[index])) {
++        if (index >= ARRAY_SIZE(kvm_vmport_tss_vcpu) ||
++            !qatomic_read(&kvm_vmport_tss_vcpu[index].done)) {
 +            return false;
 +        }
 +    }
@@ -106,16 +143,16 @@
 +    int64_t now;
 +
 +    if (!qatomic_read(&kvm_vmport_tss_debug) ||
-+        index >= ARRAY_SIZE(kvm_vmport_tss_next_diag)) {
++        index >= ARRAY_SIZE(kvm_vmport_tss_vcpu)) {
 +        return false;
 +    }
 +
 +    now = g_get_monotonic_time();
-+    if (now < kvm_vmport_tss_next_diag[index]) {
++    if (now < kvm_vmport_tss_vcpu[index].next_diag) {
 +        return false;
 +    }
 +
-+    kvm_vmport_tss_next_diag[index] = now + KVM_VMPORT_TSS_DIAG_US;
++    kvm_vmport_tss_vcpu[index].next_diag = now + KVM_VMPORT_TSS_DIAG_US;
 +    return true;
 +}
 +
@@ -389,6 +426,65 @@
 +}
 +
 +/*
++ * Perform only the cheap architectural checks here.  This runs before taking
++ * the BQL so a setup-time TSS that already failed full validation does not
++ * repeatedly serialize the VM through the expensive guest-memory checks.
++ */
++static bool kvm_vmport_tss_candidate_ready(X86CPU *cpu)
++{
++    CPUState *cs = CPU(cpu);
++    unsigned int index = cs->cpu_index;
++    KVMVMPortTSSVCPUState *state;
++    struct kvm_sregs sregs;
++    uint64_t rejected_base;
++    int ret;
++
++    if (index >= ARRAY_SIZE(kvm_vmport_tss_vcpu) ||
++        qatomic_read(&kvm_vmport_tss_feature_state) != 2) {
++        return false;
++    }
++
++    state = &kvm_vmport_tss_vcpu[index];
++    if (qatomic_read(&state->done)) {
++        return false;
++    }
++
++    ret = kvm_vcpu_ioctl(cs, KVM_GET_SREGS, &sregs);
++    if (ret < 0) {
++        return false;
++    }
++
++    if (sregs.efer & MSR_EFER_LMA) {
++        qatomic_set(&state->seen_lma, 1);
++    }
++
++    if (!(sregs.efer & MSR_EFER_LMA) || !sregs.tr.present ||
++        sregs.tr.type != 11 || !sregs.tr.base ||
++        sregs.tr.limit != KVM_VMPORT_TSS_ORIGINAL_LIMIT) {
++        kvm_vmport_tss_diag(cs, &sregs, -1,
++                            "waiting-for-windows-x64-tss");
++        return false;
++    }
++
++    if (!qatomic_read(&state->rejected_tss_valid)) {
++        return true;
++    }
++
++    rejected_base = state->rejected_tss_base;
++    if (sregs.tr.base == rejected_base) {
++        return false;
++    }
++
++    KVM_VMPORT_TSS_LOG(
++            "vmport-tss: vcpu=%d new candidate tss=0x%" PRIx64
++            " previous-rejected=0x%" PRIx64 "\n",
++            cs->cpu_index, (uint64_t)sregs.tr.base, rejected_base);
++    state->rejected_tss_base = 0;
++    qatomic_set(&state->rejected_tss_valid, 0);
++    return true;
++}
++
++/*
 + * Try to install the bitmap before VMware's user-mode driver can execute the
 + * backdoor IN instruction.  The TSS is sampled twice back-to-back; a valid
 + * sample is never allowed to resume the guest between qualification and the
@@ -413,8 +509,8 @@
 +    const char *layout;
 +    int ret;
 +
-+    if (index >= ARRAY_SIZE(kvm_vmport_tss_done) ||
-+        qatomic_read(&kvm_vmport_tss_done[index]) ||
++    if (index >= ARRAY_SIZE(kvm_vmport_tss_vcpu) ||
++        qatomic_read(&kvm_vmport_tss_vcpu[index].done) ||
 +        qatomic_read(&kvm_vmport_tss_feature_state) != 2) {
 +        return;
 +    }
@@ -425,7 +521,7 @@
 +    }
 +
 +    if (first.efer & MSR_EFER_LMA) {
-+        qatomic_set(&kvm_vmport_tss_seen_lma[index], 1);
++        qatomic_set(&kvm_vmport_tss_vcpu[index].seen_lma, 1);
 +    }
 +
 +    if (!(first.efer & MSR_EFER_LMA) || !first.tr.present ||
@@ -485,6 +581,12 @@
 +    if (!kvm_vmport_tss_select_layout(cs, second.tr.base,
 +                                      &selected_iomap, &selected_limit,
 +                                      &layout)) {
++        kvm_vmport_tss_vcpu[index].rejected_tss_base = second.tr.base;
++        qatomic_set(&kvm_vmport_tss_vcpu[index].rejected_tss_valid, 1);
++        KVM_VMPORT_TSS_LOG(
++                "vmport-tss: vcpu=%d rejected candidate tss=0x%" PRIx64
++                "; suppressing repeated expensive validation\n",
++                cs->cpu_index, (uint64_t)second.tr.base);
 +        return;
 +    }
 +
@@ -529,11 +631,11 @@
 +
 +    env->tr.limit = selected_limit;
 +    cs->vcpu_dirty = true;
-+    qatomic_set(&kvm_vmport_tss_done[index], 1);
++    qatomic_set(&kvm_vmport_tss_vcpu[index].done, 1);
 +
 +    KVM_VMPORT_TSS_LOG(
-+            "vmport-tss: vcpu=%d enabled user I/O 0x5658-0x565b "
-+            "at TSS 0x%" PRIx64 " iomap=0x%04x limit=0x%x layout=%s\n",
++            "vmport-tss: patched vcpu=%d tss=0x%" PRIx64
++            " user-io=0x5658-0x565b iomap=0x%04x limit=0x%x layout=%s\n",
 +            cs->cpu_index, (uint64_t)env->tr.base,
 +            selected_iomap, selected_limit, layout);
 +
@@ -549,8 +651,8 @@
 +            unsigned int other_index = other->cpu_index;
 +
 +            if (other != cs &&
-+                other_index < ARRAY_SIZE(kvm_vmport_tss_done) &&
-+                !qatomic_read(&kvm_vmport_tss_done[other_index])) {
++                other_index < ARRAY_SIZE(kvm_vmport_tss_vcpu) &&
++                !qatomic_read(&kvm_vmport_tss_vcpu[other_index].done)) {
 +                qemu_cpu_kick(other);
 +            }
 +        }
@@ -561,11 +663,12 @@
 +{
 +    CPUState *cs = CPU(cpu);
 +    unsigned int index = cs->cpu_index;
++    KVMVMPortTSSVCPUState *vcpu_state;
 +    int state = qatomic_read(&kvm_vmport_tss_feature_state);
 +    int64_t now;
 +
 +    if (state == 1 || state == 3 ||
-+        index >= ARRAY_SIZE(kvm_vmport_tss_next_probe)) {
++        index >= ARRAY_SIZE(kvm_vmport_tss_vcpu)) {
 +        return;
 +    }
 +
@@ -578,23 +681,31 @@
 +        bql_unlock();
 +    }
 +
-+    if (qatomic_read(&kvm_vmport_tss_done[index])) {
++    vcpu_state = &kvm_vmport_tss_vcpu[index];
++    if (qatomic_read(&vcpu_state->done)) {
 +        return;
 +    }
 +
 +    now = g_get_monotonic_time();
-+    if (now < kvm_vmport_tss_next_probe[index]) {
++    if (now < vcpu_state->next_probe) {
 +        return;
 +    }
-+    bql_lock();
-+    if (qatomic_read(&kvm_vmport_tss_feature_state) == 2 &&
-+        !qatomic_read(&kvm_vmport_tss_done[index])) {
-+        kvm_vmport_tss_enable_user_io(cpu);
-+    }
-+    bql_unlock();
 +
-+    kvm_vmport_tss_next_probe[index] = now +
-+        (qatomic_read(&kvm_vmport_tss_seen_lma[index]) ?
++    /*
++     * Keep the 10 ms long-mode cadence, but reject known-bad setup TSS bases
++     * before taking the BQL.  A changed TR base is eligible immediately.
++     */
++    if (kvm_vmport_tss_candidate_ready(cpu)) {
++        bql_lock();
++        if (qatomic_read(&kvm_vmport_tss_feature_state) == 2 &&
++            !qatomic_read(&vcpu_state->done)) {
++            kvm_vmport_tss_enable_user_io(cpu);
++        }
++        bql_unlock();
++    }
++
++    vcpu_state->next_probe = now +
++        (qatomic_read(&vcpu_state->seen_lma) ?
 +         KVM_VMPORT_TSS_PROBE_US : KVM_VMPORT_TSS_PRE_LMA_PROBE_US);
 +}
  static void kvm_rate_limit_on_bus_lock(void)
