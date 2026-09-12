@@ -2,14 +2,7 @@ diff --git a/hw/i386/vmport.c b/hw/i386/vmport.c
 index 6f40eff..b46466e 100644
 --- a/hw/i386/vmport.c
 +++ b/hw/i386/vmport.c
-@@ -36,5 +36,6 @@
- #include "system/hw_accel.h"
- #include "system/qtest.h"
- #include "qemu/log.h"
-+#include "qemu/timer.h"
- #include "trace.h"
- #include "qom/object.h"
-@@ -42,6 +43,43 @@
+@@ -42,6 +42,50 @@
  
  #define VMPORT_MAGIC   0x564D5868
  
@@ -18,10 +11,7 @@ index 6f40eff..b46466e 100644
 +#define VMPORT_GUESTRPC_COOKIE_FLAG    0x80000000
 +#define VMPORT_GUESTRPC_MAX_CHANNELS   128
 +#define VMPORT_GUESTRPC_MAX_MESSAGE    (64 * 1024)
-+#define VMPORT_GUESTRPC_MAX_KEY        128
-+#define VMPORT_GUESTRPC_MAX_VALUE      8192
-+#define VMPORT_GUESTRPC_MAX_KEYS       256
-+#define VMPORT_GUESTRPC_IDLE_TIMEOUT_MS 80000
++#define VMPORT_GUESTRPC_TIMEOUT_US     (80 * G_USEC_PER_SEC)
 +
 +typedef enum VMPortGuestRPCType {
 +    VMPORT_GUESTRPC_OPEN,
@@ -37,42 +27,47 @@ index 6f40eff..b46466e 100644
 +#define VMPORT_GUESTRPC_DORECV         0x0002
 +#define VMPORT_GUESTRPC_CLOSED         0x0004
 +
-+typedef struct VMPortGuestRPCChannel {
++typedef struct VMPortGuestRPCChannelState {
 +    bool open;
-+    bool cookie_required;
++    bool uses_cookie;
 +    uint32_t cookie;
-+    int64_t last_activity_ms;
-+    uint8_t *request;
++    int64_t last_activity;
 +    uint32_t request_size;
 +    uint32_t request_pos;
-+    char *reply;
 +    uint32_t reply_size;
 +    uint32_t reply_pos;
++} VMPortGuestRPCChannelState;
++
++typedef struct VMPortGuestRPCChannel {
++    VMPortGuestRPCChannelState state;
++    uint8_t *request;
++    char *reply;
 +} VMPortGuestRPCChannel;
++
++typedef struct VMPortGuestRPCRuntimeState {
++    uint32_t next_cookie;
++    bool debug_resolved;
++    bool debug_enabled;
++} VMPortGuestRPCRuntimeState;
 +
  /* Compatibility flags for migration */
  #define VMPORT_COMPAT_READ_SET_EAX_BIT              0
  #define VMPORT_COMPAT_SIGNAL_UNSUPPORTED_CMD_BIT    1
-@@ -76,6 +114,12 @@
+@@ -76,6 +106,10 @@
      uint8_t vmware_vmx_type;
  
      uint32_t compat_flags;
 +
 +    VMPortGuestRPCChannel guestrpc[VMPORT_GUESTRPC_MAX_CHANNELS];
-+    uint32_t guestrpc_next_cookie;
++    VMPortGuestRPCRuntimeState guestrpc_runtime;
 +    GHashTable *guestinfo;
-+    bool guestrpc_debug_resolved;
-+    bool guestrpc_debug_enabled;
  };
  
  static VMPortState *port_state;
-@@ -154,6 +198,483 @@ static VMPortState *port_state;
+@@ -154,6 +189,432 @@ static VMPortState *port_state;
      cpu->env.regs[R_EAX] = vmport_ioport_read(opaque, addr, 4);
  }
  
-+/* Keep verbose GuestRPC request/reply tracing available for future use. */
-+static bool vmport_guestrpc_trace_rpc;
-+
 +static uint32_t vmport_guestrpc_status(X86CPU *cpu, uint16_t status)
 +{
 +    CPUX86State *env = &cpu->env;
@@ -82,8 +77,60 @@ index 6f40eff..b46466e 100644
 +    return env->regs[R_EAX];
 +}
 +
++static void vmport_guestrpc_reset_channel(VMPortGuestRPCChannel *channel)
++{
++    g_free(channel->request);
++    g_free(channel->reply);
++    memset(channel, 0, sizeof(*channel));
++}
++
++static void vmport_guestrpc_reset_runtime(VMPortState *s)
++{
++    uint32_t i;
++
++    for (i = 0; i < VMPORT_GUESTRPC_MAX_CHANNELS; i++) {
++        vmport_guestrpc_reset_channel(&s->guestrpc[i]);
++    }
++
++    memset(&s->guestrpc_runtime, 0, sizeof(s->guestrpc_runtime));
++    s->guestrpc_runtime.next_cookie = 1;
++}
++
++static uint32_t vmport_guestrpc_next_cookie(VMPortState *s)
++{
++    uint32_t cookie = s->guestrpc_runtime.next_cookie;
++
++    if (!cookie) {
++        cookie = 1;
++    }
++
++    s->guestrpc_runtime.next_cookie = cookie + 1;
++    if (!s->guestrpc_runtime.next_cookie) {
++        s->guestrpc_runtime.next_cookie = 1;
++    }
++
++    return cookie;
++}
++
++static void vmport_guestrpc_sweep_channels(VMPortState *s, int64_t now)
++{
++    uint32_t i;
++
++    for (i = 0; i < VMPORT_GUESTRPC_MAX_CHANNELS; i++) {
++        VMPortGuestRPCChannel *channel = &s->guestrpc[i];
++
++        if (channel->state.open &&
++            now - channel->state.last_activity >=
++            VMPORT_GUESTRPC_TIMEOUT_US) {
++            vmport_guestrpc_reset_channel(channel);
++        }
++    }
++}
++
 +static VMPortGuestRPCChannel *vmport_guestrpc_channel(VMPortState *s,
-+                                                       uint16_t id)
++                                                       uint16_t id,
++                                                       uint32_t cookie,
++                                                       int64_t now)
 +{
 +    VMPortGuestRPCChannel *channel;
 +
@@ -92,77 +139,12 @@ index 6f40eff..b46466e 100644
 +    }
 +
 +    channel = &s->guestrpc[id - 1];
-+    return channel->open ? channel : NULL;
-+}
-+
-+static void vmport_guestrpc_reset_channel(VMPortGuestRPCChannel *channel)
-+{
-+    g_free(channel->request);
-+    g_free(channel->reply);
-+    memset(channel, 0, sizeof(*channel));
-+}
-+
-+static void vmport_guestrpc_reset_state(VMPortState *s)
-+{
-+    uint32_t i;
-+
-+    /* Keep the cookie sequence monotonic across guest resets. */
-+    for (i = 0; i < VMPORT_GUESTRPC_MAX_CHANNELS; i++) {
-+        vmport_guestrpc_reset_channel(&s->guestrpc[i]);
-+    }
-+    if (s->guestinfo) {
-+        g_hash_table_remove_all(s->guestinfo);
-+    }
-+}
-+
-+static void vmport_guestrpc_sweep(VMPortState *s, int64_t now_ms)
-+{
-+    uint32_t i;
-+
-+    for (i = 0; i < VMPORT_GUESTRPC_MAX_CHANNELS; i++) {
-+        VMPortGuestRPCChannel *channel = &s->guestrpc[i];
-+
-+        if (channel->open &&
-+            now_ms - channel->last_activity_ms >=
-+            VMPORT_GUESTRPC_IDLE_TIMEOUT_MS) {
-+            vmport_guestrpc_reset_channel(channel);
-+        }
-+    }
-+}
-+
-+static uint32_t vmport_guestrpc_new_cookie(VMPortState *s)
-+{
-+    s->guestrpc_next_cookie++;
-+    if (!s->guestrpc_next_cookie) {
-+        s->guestrpc_next_cookie++;
-+    }
-+    return s->guestrpc_next_cookie;
-+}
-+
-+static bool vmport_guestrpc_cookie_valid(VMPortGuestRPCChannel *channel,
-+                                          CPUX86State *env)
-+{
-+    uint32_t cookie;
-+
-+    if (!channel->cookie_required) {
-+        return true;
-+    }
-+
-+    cookie = (env->regs[R_EDI] & 0xffff) |
-+             ((env->regs[R_ESI] & 0xffff) << 16);
-+    return cookie == channel->cookie;
-+}
-+
-+static VMPortGuestRPCChannel *vmport_guestrpc_active_channel(
-+    VMPortState *s, CPUX86State *env, uint16_t id, int64_t now_ms)
-+{
-+    VMPortGuestRPCChannel *channel = vmport_guestrpc_channel(s, id);
-+
-+    if (!channel || !vmport_guestrpc_cookie_valid(channel, env)) {
++    if (!channel->state.open ||
++        (channel->state.uses_cookie && channel->state.cookie != cookie)) {
 +        return NULL;
 +    }
 +
-+    channel->last_activity_ms = now_ms;
++    channel->state.last_activity = now;
 +    return channel;
 +}
 +
@@ -170,8 +152,8 @@ index 6f40eff..b46466e 100644
 +{
 +    Object *vmvga;
 +
-+    if (s->guestrpc_debug_resolved) {
-+        return s->guestrpc_debug_enabled;
++    if (s->guestrpc_runtime.debug_resolved) {
++        return s->guestrpc_runtime.debug_enabled;
 +    }
 +
 +    vmvga = object_resolve_path_type("", "vmvga", NULL);
@@ -179,11 +161,13 @@ index 6f40eff..b46466e 100644
 +        return false;
 +    }
 +
-+    s->guestrpc_debug_enabled =
++    s->guestrpc_runtime.debug_enabled =
 +        object_property_get_bool(vmvga, "debug", NULL);
-+    s->guestrpc_debug_resolved = true;
-+    return s->guestrpc_debug_enabled;
++    s->guestrpc_runtime.debug_resolved = true;
++    return s->guestrpc_runtime.debug_enabled;
 +}
++
++static const bool vmport_guestrpc_trace_rpc = false;
 +
 +static GString *vmport_guestrpc_format_line(const char *prefix,
 +                                             const uint8_t *message,
@@ -236,8 +220,7 @@ index 6f40eff..b46466e 100644
 +static void vmport_guestrpc_print_rpc(VMPortState *s,
 +                                        const uint8_t *message, size_t size)
 +{
-+    if (!vmport_guestrpc_trace_rpc ||
-+        !vmport_guestrpc_debug_enabled(s)) {
++    if (!vmport_guestrpc_trace_rpc || !vmport_guestrpc_debug_enabled(s)) {
 +        return;
 +    }
 +
@@ -252,8 +235,7 @@ index 6f40eff..b46466e 100644
 +static void vmport_guestrpc_print_reply(VMPortState *s,
 +                                          const char *reply, size_t size)
 +{
-+    if (!vmport_guestrpc_trace_rpc ||
-+        !vmport_guestrpc_debug_enabled(s)) {
++    if (!vmport_guestrpc_trace_rpc || !vmport_guestrpc_debug_enabled(s)) {
 +        return;
 +    }
 +
@@ -270,8 +252,8 @@ index 6f40eff..b46466e 100644
 +{
 +    g_free(channel->reply);
 +    channel->reply = reply;
-+    channel->reply_size = strlen(reply);
-+    channel->reply_pos = 0;
++    channel->state.reply_size = strlen(reply);
++    channel->state.reply_pos = 0;
 +}
 +
 +static const char *vmport_guestrpc_guestinfo_override(const char *key)
@@ -293,36 +275,31 @@ index 6f40eff..b46466e 100644
 +    const char *value;
 +    const char *separator;
 +
-+    if (channel->request_size) {
++    if (channel->state.request_size) {
 +        request = g_strndup((const char *)channel->request,
-+                            channel->request_size);
++                            channel->state.request_size);
 +    } else {
 +        request = g_strdup("");
 +    }
 +
 +    if (!g_str_has_prefix(request, "log ")) {
 +        vmport_guestrpc_print_rpc(s, channel->request,
-+                                  channel->request_size);
++                                  channel->state.request_size);
 +    }
 +
 +    if (g_str_has_prefix(request, info_get_prefix)) {
 +        key = request + sizeof(info_get_prefix) - 1;
 +        if (g_str_has_prefix(key, "guestinfo.")) {
-+            if (strlen(key) > VMPORT_GUESTRPC_MAX_KEY) {
++            value = vmport_guestrpc_guestinfo_override(key);
++            if (!value && s->guestinfo) {
++                value = g_hash_table_lookup(s->guestinfo, key);
++            }
++            if (value) {
 +                vmport_guestrpc_set_reply(channel,
-+                                          g_strdup("0 Key is too long"));
++                                          g_strdup_printf("1 %s", value));
 +            } else {
-+                value = vmport_guestrpc_guestinfo_override(key);
-+                if (!value && s->guestinfo) {
-+                    value = g_hash_table_lookup(s->guestinfo, key);
-+                }
-+                if (value) {
-+                    vmport_guestrpc_set_reply(
-+                        channel, g_strdup_printf("1 %s", value));
-+                } else {
-+                    vmport_guestrpc_set_reply(
-+                        channel, g_strdup("0 No value found"));
-+                }
++                vmport_guestrpc_set_reply(channel,
++                                          g_strdup("0 No value found"));
 +            }
 +        } else {
 +            vmport_guestrpc_set_reply(channel,
@@ -333,45 +310,23 @@ index 6f40eff..b46466e 100644
 +        separator = strchr(key, ' ');
 +        if (separator && separator != key &&
 +            g_str_has_prefix(key, "guestinfo.")) {
-+            size_t key_len = separator - key;
-+            const char *stored_value = separator + 1;
-+            size_t value_len = strlen(stored_value);
++            char *stored_key = g_strndup(key, separator - key);
 +
-+            if (key_len > VMPORT_GUESTRPC_MAX_KEY) {
-+                vmport_guestrpc_set_reply(channel,
-+                                          g_strdup("0 Key is too long"));
-+            } else if (value_len > VMPORT_GUESTRPC_MAX_VALUE) {
-+                vmport_guestrpc_set_reply(channel,
-+                                          g_strdup("0 Value too long"));
-+            } else {
-+                char *stored_key = g_strndup(key, key_len);
-+                bool exists = s->guestinfo &&
-+                              g_hash_table_contains(s->guestinfo, stored_key);
-+
-+                if (!exists && s->guestinfo &&
-+                    g_hash_table_size(s->guestinfo) >=
-+                    VMPORT_GUESTRPC_MAX_KEYS) {
-+                    g_free(stored_key);
-+                    vmport_guestrpc_set_reply(channel,
-+                                              g_strdup("0 Too many keys"));
-+                } else {
-+                    if (!s->guestinfo) {
-+                        s->guestinfo = g_hash_table_new_full(
-+                            g_str_hash, g_str_equal, g_free, g_free);
-+                    }
-+                    g_hash_table_replace(s->guestinfo, stored_key,
-+                                         g_strdup(stored_value));
-+                    vmport_guestrpc_set_reply(channel, g_strdup("1 "));
-+                }
++            if (!s->guestinfo) {
++                s->guestinfo = g_hash_table_new_full(g_str_hash, g_str_equal,
++                                                      g_free, g_free);
 +            }
++            g_hash_table_replace(s->guestinfo, stored_key,
++                                 g_strdup(separator + 1));
++            vmport_guestrpc_set_reply(channel, g_strdup("1 "));
 +        } else {
 +            vmport_guestrpc_set_reply(channel,
 +                                      g_strdup("0 Unknown command"));
 +        }
-+    } else if (channel->request_size >= 4 &&
++    } else if (channel->state.request_size >= 4 &&
 +               !memcmp(channel->request, "log ", 4)) {
 +        vmport_guestrpc_print_log(s, channel->request + 4,
-+                                  channel->request_size - 4);
++                                  channel->state.request_size - 4);
 +        vmport_guestrpc_set_reply(channel, g_strdup("1 "));
 +    } else {
 +        vmport_guestrpc_set_reply(channel, g_strdup("0 Unknown command"));
@@ -379,7 +334,7 @@ index 6f40eff..b46466e 100644
 +
 +    if (!g_str_has_prefix(request, "log ")) {
 +        vmport_guestrpc_print_reply(s, channel->reply,
-+                                    channel->reply_size);
++                                    channel->state.reply_size);
 +    }
 +    g_free(request);
 +}
@@ -396,14 +351,16 @@ index 6f40eff..b46466e 100644
 +    CPUX86State *env = &cpu->env;
 +    uint16_t type = env->regs[R_ECX] >> 16;
 +    uint16_t id = env->regs[R_EDX] >> 16;
++    uint32_t cookie = (uint32_t)(env->regs[R_EDI] & 0xffff) |
++                      (uint32_t)((env->regs[R_ESI] & 0xffff) << 16);
++    int64_t now = g_get_monotonic_time();
 +    VMPortGuestRPCChannel *channel;
 +    uint32_t value;
 +    uint32_t remaining;
 +    uint32_t count;
 +    uint32_t i;
-+    int64_t now_ms = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
 +
-+    vmport_guestrpc_sweep(s, now_ms);
++    vmport_guestrpc_sweep_channels(s, now);
 +
 +    switch (type) {
 +    case VMPORT_GUESTRPC_OPEN:
@@ -414,20 +371,20 @@ index 6f40eff..b46466e 100644
 +        }
 +
 +        for (i = 0; i < VMPORT_GUESTRPC_MAX_CHANNELS; i++) {
-+            if (!s->guestrpc[i].open) {
++            if (!s->guestrpc[i].state.open) {
 +                channel = &s->guestrpc[i];
 +                vmport_guestrpc_reset_channel(channel);
-+                channel->open = true;
-+                channel->last_activity_ms = now_ms;
-+                channel->cookie_required =
++                channel->state.open = true;
++                channel->state.uses_cookie =
 +                    !!(value & VMPORT_GUESTRPC_COOKIE_FLAG);
-+                if (channel->cookie_required) {
-+                    channel->cookie = vmport_guestrpc_new_cookie(s);
++                channel->state.last_activity = now;
++                if (channel->state.uses_cookie) {
++                    channel->state.cookie = vmport_guestrpc_next_cookie(s);
 +                }
 +                env->regs[R_EDX] = (uint32_t)((env->regs[R_EDX] & 0xffff) |
 +                                              ((i + 1) << 16));
-+                env->regs[R_ESI] = channel->cookie >> 16;
-+                env->regs[R_EDI] = channel->cookie & 0xffff;
++                env->regs[R_EDI] = channel->state.cookie & 0xffff;
++                env->regs[R_ESI] = (channel->state.cookie >> 16) & 0xffff;
 +                return vmport_guestrpc_status(cpu,
 +                                              VMPORT_GUESTRPC_SUCCESS);
 +            }
@@ -435,7 +392,7 @@ index 6f40eff..b46466e 100644
 +        return vmport_guestrpc_status(cpu, 0);
 +
 +    case VMPORT_GUESTRPC_SENDSIZE:
-+        channel = vmport_guestrpc_active_channel(s, env, id, now_ms);
++        channel = vmport_guestrpc_channel(s, id, cookie, now);
 +        if (!channel) {
 +            return vmport_guestrpc_status(cpu, 0);
 +        }
@@ -448,16 +405,16 @@ index 6f40eff..b46466e 100644
 +        g_free(channel->request);
 +        g_free(channel->reply);
 +        channel->request = NULL;
-+        channel->request_size = value;
-+        channel->request_pos = 0;
++        channel->state.request_size = value;
++        channel->state.request_pos = 0;
 +        channel->reply = NULL;
-+        channel->reply_size = 0;
-+        channel->reply_pos = 0;
++        channel->state.reply_size = 0;
++        channel->state.reply_pos = 0;
 +
 +        if (value) {
 +            channel->request = g_try_malloc(value);
 +            if (!channel->request) {
-+                channel->request_size = 0;
++                channel->state.request_size = 0;
 +                return vmport_guestrpc_status(cpu, 0);
 +            }
 +        } else {
@@ -466,25 +423,25 @@ index 6f40eff..b46466e 100644
 +        return vmport_guestrpc_status(cpu, VMPORT_GUESTRPC_SUCCESS);
 +
 +    case VMPORT_GUESTRPC_SENDPAYLOAD:
-+        channel = vmport_guestrpc_active_channel(s, env, id, now_ms);
++        channel = vmport_guestrpc_channel(s, id, cookie, now);
 +        if (!channel || !channel->request ||
-+            channel->request_pos >= channel->request_size) {
++            channel->state.request_pos >= channel->state.request_size) {
 +            return vmport_guestrpc_status(cpu, 0);
 +        }
 +
 +        value = env->regs[R_EBX];
-+        remaining = channel->request_size - channel->request_pos;
++        remaining = channel->state.request_size - channel->state.request_pos;
 +        count = MIN(remaining, 4u);
 +        for (i = 0; i < count; i++) {
-+            channel->request[channel->request_pos++] = value >> (i * 8);
++            channel->request[channel->state.request_pos++] = value >> (i * 8);
 +        }
-+        if (channel->request_pos == channel->request_size) {
++        if (channel->state.request_pos == channel->state.request_size) {
 +            vmport_guestrpc_finish_request(s, channel);
 +        }
 +        return vmport_guestrpc_status(cpu, VMPORT_GUESTRPC_SUCCESS);
 +
 +    case VMPORT_GUESTRPC_RECVSIZE:
-+        channel = vmport_guestrpc_active_channel(s, env, id, now_ms);
++        channel = vmport_guestrpc_channel(s, id, cookie, now);
 +        if (!channel) {
 +            return vmport_guestrpc_status(cpu, 0);
 +        }
@@ -492,25 +449,25 @@ index 6f40eff..b46466e 100644
 +            return vmport_guestrpc_status(cpu, VMPORT_GUESTRPC_SUCCESS);
 +        }
 +
-+        channel->reply_pos = 0;
-+        env->regs[R_EBX] = channel->reply_size;
++        channel->state.reply_pos = 0;
++        env->regs[R_EBX] = channel->state.reply_size;
 +        env->regs[R_EDX] = (uint32_t)((env->regs[R_EDX] & 0xffff) |
 +                                      (VMPORT_GUESTRPC_SENDSIZE << 16));
 +        return vmport_guestrpc_status(cpu, VMPORT_GUESTRPC_SUCCESS |
 +                                      VMPORT_GUESTRPC_DORECV);
 +
 +    case VMPORT_GUESTRPC_RECVPAYLOAD:
-+        channel = vmport_guestrpc_active_channel(s, env, id, now_ms);
++        channel = vmport_guestrpc_channel(s, id, cookie, now);
 +        if (!channel || !channel->reply ||
-+            channel->reply_pos >= channel->reply_size) {
++            channel->state.reply_pos >= channel->state.reply_size) {
 +            return vmport_guestrpc_status(cpu, 0);
 +        }
 +
-+        remaining = channel->reply_size - channel->reply_pos;
++        remaining = channel->state.reply_size - channel->state.reply_pos;
 +        count = MIN(remaining, 4u);
 +        value = 0;
 +        for (i = 0; i < count; i++) {
-+            value |= (uint32_t)(uint8_t)channel->reply[channel->reply_pos++]
++            value |= (uint32_t)(uint8_t)channel->reply[channel->state.reply_pos++]
 +                     << (i * 8);
 +        }
 +        env->regs[R_EBX] = value;
@@ -519,17 +476,12 @@ index 6f40eff..b46466e 100644
 +        return vmport_guestrpc_status(cpu, VMPORT_GUESTRPC_SUCCESS);
 +
 +    case VMPORT_GUESTRPC_RECVSTATUS:
-+        channel = vmport_guestrpc_active_channel(s, env, id, now_ms);
-+        if (!channel) {
-+            return vmport_guestrpc_status(cpu, 0);
-+        }
-+        g_clear_pointer(&channel->reply, g_free);
-+        channel->reply_size = 0;
-+        channel->reply_pos = 0;
-+        return vmport_guestrpc_status(cpu, VMPORT_GUESTRPC_SUCCESS);
++        channel = vmport_guestrpc_channel(s, id, cookie, now);
++        return vmport_guestrpc_status(cpu, channel ?
++                                      VMPORT_GUESTRPC_SUCCESS : 0);
 +
 +    case VMPORT_GUESTRPC_CLOSE:
-+        channel = vmport_guestrpc_active_channel(s, env, id, now_ms);
++        channel = vmport_guestrpc_channel(s, id, cookie, now);
 +        if (!channel) {
 +            return vmport_guestrpc_status(cpu, 0);
 +        }
@@ -542,23 +494,30 @@ index 6f40eff..b46466e 100644
 +    }
 +}
 +
-+static void vmport_reset(DeviceState *dev)
-+{
-+    vmport_guestrpc_reset_state(VMPORT(dev));
-+}
-+
  static uint32_t vmport_cmd_get_version(void *opaque, uint32_t addr)
  {
      X86CPU *cpu = X86_CPU(current_cpu);
-@@ -244,6 +765,7 @@ static uint32_t vmport_cmd_get_version(void *opaque, uint32_t addr)
+@@ -244,6 +641,8 @@ static uint32_t vmport_cmd_get_version(void *opaque, uint32_t addr)
      /* Register some generic port commands */
++    vmport_guestrpc_reset_runtime(s);
      vmport_register(VMPORT_CMD_GETVERSION, vmport_cmd_get_version, NULL);
      vmport_register(VMPORT_CMD_GETRAMSIZE, vmport_cmd_ram_size, NULL);
 +    vmport_register(VMPORT_CMD_MESSAGE, vmport_cmd_message, s);
      if (s->compat_flags & VMPORT_COMPAT_CMDS_V2) {
          vmport_register(VMPORT_CMD_GETBIOSUUID, vmport_cmd_get_bios_uuid, NULL);
          vmport_register(VMPORT_CMD_GETHZ, vmport_cmd_get_hz, NULL);
-@@ -289,8 +811,9 @@ static void vmport_class_initfn(ObjectClass *klass, const void *data)
+@@ -280,11 +280,19 @@ static const Property vmport_properties[] = {
+     DEFINE_PROP_UINT8("vmware-vmx-type", VMPortState, vmware_vmx_type, 2),
+ };
+ 
++static void vmport_reset(DeviceState *dev)
++{
++    VMPortState *s = VMPORT(dev);
++
++    vmport_guestrpc_reset_runtime(s);
++}
++
+ static void vmport_class_initfn(ObjectClass *klass, const void *data)
  {
      DeviceClass *dc = DEVICE_CLASS(klass);
  
@@ -567,7 +526,6 @@ index 6f40eff..b46466e 100644
      /* Reason: realize sets global port_state */
      dc->user_creatable = false;
      device_class_set_props(dc, vmport_properties);
- }
 diff --git a/include/hw/i386/vmport.h b/include/hw/i386/vmport.h
 index 111136d..d0251bf 100644
 --- a/include/hw/i386/vmport.h
