@@ -4,8 +4,8 @@ FROM registry.gitlab.com/qemu-project/qemu/qemu/debian:latest AS builder
 
 ARG VERSION_ARG="0.0.0"
 
-ARG QEMU_VERSION="11.1.0"
-ARG QEMU_REF="84f07211cc5b4fc6a371559bf8a5de4fb068e648"
+ARG QEMU_VERSION="11.1.1"
+ARG QEMU_REF="c3d48b7d1e89604920e5b81b91140c2ad39a1943"
 
 ARG DEBIAN_FRONTEND="noninteractive"
 
@@ -285,7 +285,7 @@ RUN <<'EOF_VERIFY'
   fi
 
   LD_BIND_NOW=1 "$binary" --version \
-    | grep -F "QEMU emulator version 11.1.0"
+    | grep -F "QEMU emulator version 11.1.1"
 
   QEMU_MODULE_DIR=/nonexistent LD_BIND_NOW=1 \
     "$binary" -device virtio-vga-gl,help \
