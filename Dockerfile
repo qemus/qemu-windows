@@ -84,8 +84,8 @@ RUN <<EOF_SOURCE
   # Overlay the latest enhanced VMware implementation onto the same QEMU 11.1
   # source tree that contains the Helios integration. qemu-vmvga is source-only:
   # its complete hw/ files are compiled by QEMU in place of the upstream files.
-  actual="$(git -C qemu-vmvga rev-parse HEAD)"
-  echo "Using qemu-vmvga commit $actual"
+  vmvga_commit="$(git -C qemu-vmvga rev-parse HEAD)"
+  echo "Using qemu-vmvga commit $vmvga_commit"
 
   qemu_hw="qemu/hw"
   vmvga_hw="qemu-vmvga/hw"
