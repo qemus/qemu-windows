@@ -19,9 +19,9 @@ The project is intended to provide one QEMU binary that works well across a wide
 
 ## Graphics acceleration 🚀
 
-### VMVGA
+### VMVGA 🖥️
 
-QEMU Windows includes [VMVGA](https://github.com/qemus/qemu-vmvga), a virtual graphics adapter implementing the VMware SVGA/SVGA3D interfaces to provide GPU acceleration. This is especially useful for older Windows versions for which modern paravirtualized graphics drivers are not an option.
+This build includes [VMVGA](https://github.com/qemus/qemu-vmvga), a virtual graphics adapter implementing the VMware SVGA/SVGA3D interfaces to provide GPU acceleration. This is especially useful for older Windows versions for which modern paravirtualized graphics drivers are not an option.
 
 ### virtio-gpu and Vulkan
 
