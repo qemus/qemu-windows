@@ -4,9 +4,6 @@ FROM registry.gitlab.com/qemu-project/qemu/qemu/debian:latest AS builder
 
 ARG VERSION_ARG="0.0.0"
 
-ARG QEMU_VERSION="11.1.1"
-ARG QEMU_REF="c3d48b7d1e89604920e5b81b91140c2ad39a1943"
-
 ARG DEBIAN_FRONTEND="noninteractive"
 
 RUN <<EOF_BUILD_DEPS
@@ -65,24 +62,14 @@ RUN <<EOF_VIRGL
   ldconfig
 EOF_VIRGL
 
+ADD --keep-git-dir=true https://github.com/winboat-org/qemu-helios.git#helios-11.1.1 /src/qemu
 ADD --keep-git-dir=true https://github.com/qemus/qemu-vmvga.git#master /src/qemu-vmvga
 
 RUN <<EOF_SOURCE
   set -eu
 
-  git init qemu
-  git -C qemu remote add origin https://gitlab.com/qemu-project/qemu.git
-  git -C qemu fetch --depth=1 origin "refs/tags/v${QEMU_VERSION}"
-  git -C qemu checkout --detach FETCH_HEAD
-
-  actual="$(git -C qemu rev-parse HEAD)"
-  if [ "$actual" != "${QEMU_REF}" ]; then
-    echo "FAIL: QEMU v${QEMU_VERSION} resolved to $actual instead of ${QEMU_REF}."
-    exit 1
-  fi
-
-  # Overlay the latest enhanced VMware implementation onto the same QEMU 11.1
-  # source tree that contains the Helios integration. qemu-vmvga is source-only:
+  # Overlay the latest enhanced VMware implementation onto the pre-patched
+  # Helios QEMU 11.1.1 source tree. qemu-vmvga is source-only:
   # its complete hw/ files are compiled by QEMU in place of the upstream files.
   vmvga_commit="$(git -C qemu-vmvga rev-parse HEAD)"
   echo "Using qemu-vmvga commit $vmvga_commit"
@@ -92,7 +79,7 @@ RUN <<EOF_SOURCE
 
   cp -a "$vmvga_hw/." "$qemu_hw/"
 
-  # A git tag checkout does not contain Meson wrap sources. Prefetch the
+  # The Git source checkout does not contain Meson wrap sources. Prefetch the
   # subprojects required by the system UI and TCG test configuration so the
   # later --disable-download configure step can remain offline.
   meson subprojects download --sourcedir qemu \
@@ -105,21 +92,8 @@ EOF_SOURCE
 # General QEMU compatibility patches maintained by qemu-windows.
 COPY patches /tmp/qemu-windows-patches
 
-# Helios-specific files and patches remain maintained in qemu-helios. Fetch them
-# at build time instead of carrying duplicate copies in this repository.
-ADD https://github.com/qemus/qemu-helios.git#master /tmp/qemu-helios
-
 RUN <<'EOF_PATCHES'
   set -eu
-
-  install -Dm644 /tmp/qemu-helios/files/vulkan-readback.c /src/qemu/ui/vulkan-readback.c
-  install -Dm644 /tmp/qemu-helios/files/vulkan-readback.h /src/qemu/ui/vulkan-readback.h
-
-  for patch in /tmp/qemu-helios/patches/*.patch; do
-    echo "Applying Helios ${patch##*/}..."
-    git -C /src/qemu apply --recount --check "$patch"
-    git -C /src/qemu apply --recount "$patch"
-  done
 
   for patch in /tmp/qemu-windows-patches/*.patch; do
     echo "Applying qemu-windows ${patch##*/}..."
